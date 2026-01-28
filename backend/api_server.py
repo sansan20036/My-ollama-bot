@@ -1,3 +1,4 @@
+﻿# -*- coding: utf-8 -*-
 import shutil
 import os
 import logging
@@ -13,7 +14,7 @@ import asyncio
 import random
 import requests
 
-# 確保 file_factory 存在
+# 引入 file_factory 模組
 from file_factory import FileLoaderFactory
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -54,7 +55,8 @@ class EnsembleRetriever(BaseRetriever):
                         all_docs.append(doc)
                         seen_contents.add(doc.page_content)
             except Exception as e:
-                print(f"⚠️ 檢索器執行錯誤: {e}")
+                # 這裡改用英文 Log 避免亂碼
+                print(f"Warning in retriever: {e}")
                 continue
         return all_docs[:10]
 
@@ -390,5 +392,5 @@ async def chat_endpoint(request: ChatRequest):
 
 if __name__ == "__main__":
     import uvicorn
-
-    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
+    # 務必確認沒有 reload=True
+    uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -1,24 +1,13 @@
-# Logs
-logs
-*.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
-lerna-debug.log*
+# Python 暫存檔
+**/__pycache__/
+*.pyc
 
-node_modules
-dist
-dist-ssr
-*.local
+# 資料庫檔案
+**/chroma_db/
+*.sqlite3
 
-# Editor directories and files
-.vscode/*
-!.vscode/extensions.json
-.idea
+# Node.js 套件
+node_modules/
+
+# 系統檔案
 .DS_Store
-*.suo
-*.ntvs*
-*.njsproj
-*.sln
-*.sw?

@@ -17,7 +17,8 @@ import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, Responsive
 
 import {
   Send, Upload, Trash2, Bot, User, Loader2, Paperclip, X, Sparkles,
-  Clock, WifiOff, Plus, Archive, MessageCircle, Square, ExternalLink, BarChart2, Zap
+  Clock, WifiOff, Plus, Archive, MessageCircle, Square, ExternalLink, BarChart2, Zap,
+  Image as ImageIcon // 🟢 圖片圖示
 } from "lucide-react";
 
 const API_CONFIG = {
@@ -94,8 +95,6 @@ const SortableHeader = ({ id, children }) => {
 };
 
 // 🟢 思考泡泡 (整合了解碼文字流)
-// 找到原本的 ThinkingBubble，將其內容改為：
-// 🟢 請完全替換這個 ThinkingBubble 元件
 const ThinkingBubble = ({ content }) => {
   const [timer, setTimer] = useState(0.0);
 
@@ -436,7 +435,7 @@ const MarkdownRenderer = ({ content }) => {
         ),
       }}
     >
-      {content}
+      {content.replace(/\\\[/g, '$$').replace(/\\\]/g, '$$').replace(/\\\(/g, '$').replace(/\\\)/g, '$')}
     </ReactMarkdown>
   );
 };
@@ -503,6 +502,10 @@ function App() {
   const [filesToUpload, setFilesToUpload] = useState([]);
   const [errorModal, setErrorModal] = useState({ show: false, message: "" });
 
+  // 🟢 新增：聊天圖片相關狀態
+  const chatImageInputRef = useRef(null);
+  const [chatImages, setChatImages] = useState([]);
+
   const fileInputRef = useRef(null);
   const chatEndRef = useRef(null);
   const textareaRef = useRef(null);
@@ -521,10 +524,10 @@ function App() {
           messages: [defaultMessage],
           createdAt: Date.now()
         };
-        setSessions([initSession]);           // 1. 狀態設為只有一個新對話
-        setCurrentSessionId(initSession.id);  // 2. 切換到該對話
-        setMessages([defaultMessage]);        // 3. 訊息清空
-        localStorage.removeItem("chatSessions"); // 4. 清除瀏覽器快取
+        setSessions([initSession]);
+        setCurrentSessionId(initSession.id);
+        setMessages([defaultMessage]);
+        localStorage.removeItem("chatSessions");
         setMessages([{ role: 'system', content: '🚀 **SYSTEM PURGED**\n記憶體與資料庫已強制格式化，請上傳新檔案。' }]);
         setFilesToUpload([]);
       } catch (error) {
@@ -538,13 +541,11 @@ function App() {
   useEffect(() => {
     const fetchModels = async () => {
       try {
-        // 前端只問後端 (localhost:8000)，不直接連遠端
         const response = await axios.get(`${API_BASE}/models`);
         const models = response.data.models;
 
         if (models && models.length > 0) {
           setAvailableModels(models);
-          // 如果原本選的模型不在清單內，就預設選第一個
           if (!models.includes(selectedModel)) {
             setSelectedModel(models[0]);
           }
@@ -561,7 +562,7 @@ function App() {
       if (!chatEndRef.current) return;
       chatEndRef.current.scrollIntoView({ behavior: "smooth", block: "end" });
     });
-  }, [isLoading]);;
+  }, [isLoading]);
 
   useEffect(() => {
     if (textareaRef.current) {
@@ -696,16 +697,52 @@ function App() {
     });
   };
 
+  // 🟢 新增：處理圖片轉 Base64
+  const processImageFile = (file) => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.readAsDataURL(file);
+      reader.onload = () => {
+        const result = reader.result.toString();
+        // 移除 data URL header 取得純 base64 字串
+        const base64 = result.split(',')[1];
+        resolve({
+          id: Date.now() + Math.random(),
+          url: result,    // 用於前端預覽
+          base64: base64, // 用於後端發送
+          name: file.name
+        });
+      };
+      reader.onerror = error => reject(error);
+    });
+  };
+
+  const handleChatImageSelect = async (e) => {
+    const files = Array.from(e.target.files);
+    if (files.length === 0) return;
+    const processedImages = await Promise.all(files.map(processImageFile));
+    setChatImages(prev => [...prev, ...processedImages]);
+    e.target.value = "";
+  };
+
+  const removeChatImage = (index) => {
+    setChatImages(prev => prev.filter((_, i) => i !== index));
+  };
+
   const handleSendMessage = async (e) => {
     if (e && e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
     } else if (e && (e.key !== "Enter" || e.shiftKey)) {
       return;
     }
-    if (!input.trim()) return;
+    if (!input.trim() && chatImages.length === 0) return;
 
     const userMsgContent = input;
-    const userMessage = { role: "User", content: userMsgContent };
+    const userMessage = {
+      role: "User",
+      content: userMsgContent,
+      images: chatImages.map(img => img.url) // 存預覽圖供顯示
+    };
 
     // 1. 先顯示使用者的訊息，並預留一個 AI 的空位
     setMessages((prev) => [
@@ -714,10 +751,31 @@ function App() {
       { role: "AI", content: "", sources: [], isTyping: true }
     ]);
 
+    const imagesPayload = chatImages.map(img => img.base64);
+    setChatImages([]);
     setInput("");
     setIsLoading(true);
     const controller = new AbortController();
     abortControllerRef.current = controller;
+
+    let effectiveModel = selectedModel;
+
+    /*if (chatImages.length > 0) {
+      // 如果有圖片，嘗試從 availableModels 裡找一個能看圖的模型
+      // 搜尋順序：Llava -> MiniCPM -> Moondream
+      const visualModel = availableModels.find(m => m.includes("llava")) ||
+        availableModels.find(m => m.includes("minicpm")) ||
+        availableModels.find(m => m.includes("moondream"));
+
+      if (visualModel) {
+        // ✅ 找到了！(例如找到 "llava:latest")，直接使用它
+        effectiveModel = visualModel;
+      } else {
+        // ❌ 找不到任何已知的視覺模型，只好硬帶 "llava" 碰運氣，並警告使用者
+        effectiveModel = "llava";
+        alert("⚠️ 系統偵測到圖片，但找不到已安裝的視覺模型 (Llava/MiniCPM/Moondream)。請確認 Ollama 設定。");
+      }
+    }*/
 
     try {
       const response = await fetch(`${API_BASE}/chat`, {
@@ -725,7 +783,8 @@ function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           query: userMsgContent,
-          model_name: selectedModel
+          model_name: effectiveModel,
+          images: imagesPayload
         }),
         signal: controller.signal,
       });
@@ -907,9 +966,9 @@ function App() {
                 </div>
                 <p className="text-sm font-semibold text-slate-300 group-hover:text-white transition-colors">Upload Files</p>
                 <div className="flex justify-center gap-1.5 mt-3">
-                  <span className="text-[9px] bg-slate-900/80 px-2 py-0.5 rounded text-fuchsia-300 border border-fuchsia-500/20">PDF</span>
-                  <span className="text-[9px] bg-slate-900/80 px-2 py-0.5 rounded text-cyan-300 border border-cyan-500/20">DOCX</span>
-                  <span className="text-[9px] bg-slate-900/80 px-2 py-0.5 rounded text-violet-300 border border-violet-500/20">IMG</span>
+                  <span className="text-[9px] bg-slate-900/80 px-2 py-0.5 rounded text-orange-300 border border-orange-500/20">PDF</span>
+                  <span className="text-[9px] bg-slate-900/80 px-2 py-0.5 rounded text-cyan-300 border border-blue-500/20">DOCX</span>
+                  <span className="text-[9px] bg-slate-900/80 px-2 py-0.5 rounded text-purple-300 border border-purple-500/20">JPG</span>
                   <span className="text-[9px] bg-slate-900/80 px-2 py-0.5 rounded text-emerald-300 border border-emerald-500/20">XLSX</span>
                 </div>
                 <input
@@ -1006,6 +1065,14 @@ function App() {
                           </div>
                         )}
 
+                        {msg.images && msg.images.length > 0 && (
+                          <div className="flex flex-wrap gap-2 mb-3">
+                            {msg.images.map((imgUrl, i) => (
+                              <img key={i} src={imgUrl} alt="uploaded" className="max-w-[200px] max-h-[200px] rounded-lg border border-white/20" />
+                            ))}
+                          </div>
+                        )}
+
                         {!msg.isTyping && msg.sources && msg.sources.length > 0 && (
                           <div className="mt-4 pt-3 border-t border-white/20 flex flex-wrap gap-2">
                             {msg.sources.map((src, i) => (
@@ -1030,10 +1097,58 @@ function App() {
 
             <div ref={chatEndRef} />
           </div>
+          {/* 輸入框區域 */}
           <div className="p-8 pt-2 z-20">
             <div className="relative max-w-4xl mx-auto">
               <div className="absolute -inset-1 bg-gradient-to-r from-fuchsia-500 via-violet-500 to-cyan-500 rounded-full opacity-30 blur-md group-focus-within:opacity-60 transition-opacity duration-500" />
-              <div className="relative flex items-center gap-3 bg-white/90 backdrop-blur-2xl rounded-3xl p-2 pl-6 shadow-[0_10px_30px_-5px_rgba(6,182,212,0.2)] border border-white">
+
+              {/* 🟢 新增：圖片預覽區 (放在輸入框容器上方) */}
+              <AnimatePresence>
+                {chatImages.length > 0 && (
+                  <motion.div
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: 10 }}
+                    className="absolute bottom-full mb-3 left-0 flex gap-2"
+                  >
+                    {chatImages.map((img, index) => (
+                      <div key={img.id} className="relative group">
+                        <img src={img.url} alt="preview" className="h-16 w-16 object-cover rounded-xl border-2 border-cyan-400 shadow-lg" />
+                        <button
+                          onClick={() => removeChatImage(index)}
+                          className="absolute -top-1 -right-1 bg-red-500 text-white rounded-full p-0.5 shadow-md hover:bg-red-600 transition-colors"
+                        >
+                          <X size={10} />
+                        </button>
+                      </div>
+                    ))}
+                  </motion.div>
+                )}
+              </AnimatePresence>
+
+              <div className="relative flex items-center gap-3 bg-white/90 backdrop-blur-2xl rounded-3xl p-2 pl-4 shadow-[0_10px_30px_-5px_rgba(6,182,212,0.2)] border border-white">
+
+                {/* 🟢 圖片功能已註解掉 (開始) */}
+                {/* <motion.button
+                  whileHover={{ scale: 1.1 }}
+                  whileTap={{ scale: 0.9 }}
+                  onClick={() => chatImageInputRef.current.click()}
+                  className="p-2 rounded-full text-slate-400 hover:bg-slate-100 hover:text-cyan-500 transition-all"
+                  title="Upload Image"
+                >
+                  <ImageIcon size={20} />
+                </motion.button>
+                
+                <input
+                  ref={chatImageInputRef}
+                  type="file"
+                  className="hidden"
+                  accept="image/*"
+                  multiple
+                  onChange={handleChatImageSelect}
+                />
+                */}
+
                 <textarea
                   ref={textareaRef}
                   value={input}
@@ -1048,7 +1163,8 @@ function App() {
                   whileHover={{ scale: 1.05 }}
                   whileTap={{ scale: 0.95 }}
                   onClick={() => isLoading ? handleStop() : handleSendMessage()}
-                  disabled={!input.trim() && !isLoading}
+                  // 🟢 修改：允許只傳圖片 (當 input 為空但有圖片時，按鈕依然可用)
+                  disabled={!input.trim() && chatImages.length === 0 && !isLoading}
                   className={`p-3 rounded-full text-white shadow-lg transition-all self-end ${isLoading
                     ? "bg-gradient-to-r from-red-500 to-orange-500 hover:shadow-red-500/30 cursor-pointer"
                     : "bg-gradient-to-r from-fuchsia-600 to-cyan-600 hover:shadow-cyan-500/30 disabled:opacity-50 disabled:cursor-not-allowed"

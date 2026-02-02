@@ -593,22 +593,55 @@ function App() {
   }, [messages, currentSessionId]);
 
   const createNewChat = () => {
+    // 1. 如果正在等待 AI 回覆 (isLoading 為 true)，先不要讓使用者開新對話，避免中斷連線
+    if (isLoading) {
+      alert("請等待 AI 回覆完成後再開啟新對話。");
+      return;
+    }
+
+    // 2. 建立一個全新的 Session 物件
     const newSession = {
       id: Date.now(),
       title: "New Session",
-      messages: [defaultMessage],
+      messages: [defaultMessage], // 每個新對話都有自己的歡迎詞
       createdAt: Date.now()
     };
+
+    // 3. 更新 Session 列表：把新的放在最上面，但保留舊的 (prev)
     setSessions(prev => [newSession, ...prev]);
+
+    // 4. 切換視角到這個新的 Session
     setCurrentSessionId(newSession.id);
-    setMessages([defaultMessage]);
+
+    // 5. 更新目前的訊息視窗為這個新 Session 的訊息 (也就是只有歡迎詞)
+    setMessages(newSession.messages);
+
+    // 6. 清空圖片暫存
+    setChatImages([]);
+
+    // ⚠️ 注意：這裡我們 "不" 呼叫後端的 /new_chat 或 /reset
+    // 因為後端目前的設計是 "單一全域大腦" (Single Global Context)。
+    // 如果你在新對話上傳新檔案，舊對話的 context 也會變髒 (這是目前架構的限制)。
+    // 但至少 UI 上，你的舊對話紀錄不會不見，你可以點左邊的列表切換回去。
   };
 
   const switchSession = (sessionId) => {
-    const session = sessions.find(s => s.id === sessionId);
-    if (session) {
+    // 1. 先把「當前」的對話紀錄存回 sessions 陣列 (Auto-save)
+    // 雖然 useEffect 已經有做 sync，但手動切換時再防呆一次
+    setSessions(prevSessions => prevSessions.map(s =>
+      s.id === currentSessionId ? { ...s, messages: messages } : s
+    ));
+
+    // 2. 找出目標 Session
+    const targetSession = sessions.find(s => s.id === sessionId);
+
+    if (targetSession) {
+      // 3. 切換 ID
       setCurrentSessionId(sessionId);
-      setMessages(session.messages);
+      // 4. 載入目標 Session 的訊息到畫面上
+      setMessages(targetSession.messages);
+      // 5. 清空圖片暫存 (因為換房間了)
+      setChatImages([]);
     }
   };
 
@@ -1128,7 +1161,6 @@ function App() {
 
               <div className="relative flex items-center gap-3 bg-white/90 backdrop-blur-2xl rounded-3xl p-2 pl-4 shadow-[0_10px_30px_-5px_rgba(6,182,212,0.2)] border border-white">
 
-                {/* 🟢 圖片功能已註解掉 (開始) */}
                 {/* <motion.button
                   whileHover={{ scale: 1.1 }}
                   whileTap={{ scale: 0.9 }}

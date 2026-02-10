@@ -1,7 +1,11 @@
-﻿.idea/
-chroma_db/
-.venv/
+venv/
+uploads/
 __pycache__/
-.env
-
-chroma/
+chroma_db_api/
+data/
+node_modules/
+.run/
+.idea/
+*.pyc
+*.db
+package-lock.json

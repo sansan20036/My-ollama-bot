@@ -1,4 +1,34 @@
+/* =========================================
+   1. 原本的 React/Vite 預設樣式 (保留)
+   ========================================= */
+:root {
+  font-family: Inter, system-ui, Avenir, Helvetica, Arial, sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+
+  color-scheme: light dark;
+  color: rgba(255, 255, 255, 0.87);
+  background-color: #242424;
+
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  /* 確保背景能延伸到全螢幕，避免捲動時出現白邊 */
+  min-width: 320px;
+  min-height: 100vh;
+  background-color: #0f0c29;
+  /* 配合您的 Cyberpunk 背景色 */
+}
+
 #root {
+  /* ⚠️ 注意：原本的 max-width: 1280px 和 padding 可能會限制您的全螢幕應用 */
+  /* 如果發現畫面被切掉或無法全寬，請註解掉下面這三行 */
   max-width: 1280px;
   margin: 0 auto;
   padding: 2rem;
@@ -11,9 +41,11 @@
   will-change: filter;
   transition: filter 300ms;
 }
+
 .logo:hover {
   filter: drop-shadow(0 0 2em #646cffaa);
 }
+
 .logo.react:hover {
   filter: drop-shadow(0 0 2em #61dafbaa);
 }
@@ -22,6 +54,7 @@
   from {
     transform: rotate(0deg);
   }
+
   to {
     transform: rotate(360deg);
   }
@@ -39,4 +72,63 @@
 
 .read-the-docs {
   color: #888;
+}
+
+/* =========================================
+   🟢 2. 新增：自訂捲軸樣式 (Cyberpunk 風格)
+   ========================================= */
+
+/* 針對所有有 .custom-scrollbar 類別的容器 (例如您的表格、側邊欄) */
+.custom-scrollbar {
+  scrollbar-width: thin;
+  /* Firefox 支援 */
+  scrollbar-color: #0891b2 rgba(15, 23, 42, 0.6);
+  /* Firefox 顏色 */
+}
+
+/* Chrome, Edge, Safari 的捲軸設定 */
+.custom-scrollbar::-webkit-scrollbar {
+  width: 8px;
+  /* 垂直捲軸寬度 */
+  height: 8px;
+  /* 🔥 水平捲軸高度 (讓表格左右滑動時好拉動) */
+}
+
+/* 捲軸軌道 (背景) */
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: rgba(0, 0, 0, 0.4);
+  /* 深黑色半透明背景 */
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  /* 微微的邊框 */
+}
+
+/* 捲軸拉桿 (滑塊) */
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background: #0891b2;
+  /* 預設：明亮的青色 */
+  border-radius: 6px;
+  /* 圓角 */
+  border: 2px solid rgba(15, 23, 42, 0.8);
+  /* 加一圈深色邊框，讓滑塊有「懸浮」的立體感 */
+  background-clip: padding-box;
+}
+
+/* 滑鼠移上去時變亮 */
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: #22d3ee;
+  /* 🔥 懸停時：超亮螢光青 (Cyan-400) */
+  border: 1px solid rgba(15, 23, 42, 0.8);
+  /* 邊框變細，視覺上滑塊變大 */
+}
+
+/* 正在拖曳時 */
+.custom-scrollbar::-webkit-scrollbar-thumb:active {
+  background: #67e8f9;
+  /* 🔥 拖曳時：接近白色的青 (Cyan-300) */
+}
+
+/* 讓表格內容強制不換行，確保能撐開寬度 (這是水平滑動的關鍵) */
+.whitespace-nowrap {
+  white-space: nowrap !important;
 }

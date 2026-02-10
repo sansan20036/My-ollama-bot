@@ -18,11 +18,17 @@ import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, Responsive
 import {
   Send, Upload, Trash2, Bot, User, Loader2, Paperclip, X, Sparkles,
   Clock, WifiOff, Plus, Archive, MessageCircle, Square, ExternalLink, BarChart2, Zap,
-  Image as ImageIcon // 🟢 圖片圖示
+  Image as ImageIcon, // 🟢 圖片圖示
+
+  // 🔥 請新增下面這三個：
+  FileText,   // 用於顯示文件圖示
+  Eye,        // 用於檢視按鈕 (眼睛)
+  RefreshCw   // 用於重新整理列表 (旋轉箭頭)
+
 } from "lucide-react";
 
 const API_CONFIG = {
-  BASE_URL: "http://127.0.0.1:8000",
+  BASE_URL: "http://127.0.0.1:8000/api",
   TYPING_SPEED: 50,      // 打字速度 (毫秒)
   CHUNK_SIZE: 1,         // 每次吐幾個字
   TIMEOUT: 500,          // 停止打字後的延遲
@@ -43,7 +49,7 @@ const CyberpunkNeonBackground = () => (
     <div className="absolute inset-0 pointer-events-none">
       <div className="absolute top-[20%] left-0 w-full h-[2px] bg-gradient-to-r from-transparent via-cyan-400 to-transparent opacity-50 animate-scanline" />
     </div>
-    <div className="absolute inset-0 bg-[url('https://grainy-gradients.vercel.app/noise.svg')] opacity-20 mix-blend-overlay" />
+    <div className="absolute inset-0 bg-[url('data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMDAlIiBoZWlnaHQ9IjEwMCUiPjxmaWx0ZXIgaWQ9Im4iPjxmZVR1cmJ1bGVuY2UgdHlwZT0iZnJhY3RhbE5vaXNlIiBiYXNlRnJlcXVlbmN5PSIwLjUiIG51bU9jdGF2ZXM9IjMiIHN0aXRjaFRpbGVzPSJzdGl0Y2giLz48L2ZpbHRlcj48cmVjdCB3aWR0aD0iMTAwJSIgaGVpZ2h0PSIxMDAlIiBmaWxsPSJ0cmFuc3BhcmVudCIvPjxyZWN0IHdpZHRoPSIxMDAlIiBoZWlnaHQ9IjEwMCUiIGZpbGw9IiNmZmZmZmYiIG9wYWNpdHk9IjAuNSIgZmlsdGVyPSJ1cmwoI24pIi8+PC9zdmc+')] opacity-10 mix-blend-overlay" />
   </div>
 );
 
@@ -73,9 +79,9 @@ const SortableHeader = ({ id, children }) => {
     transform: CSS.Transform.toString(transform),
     transition,
     cursor: isDragging ? 'grabbing' : 'grab',
-    backgroundColor: isDragging ? 'rgba(6, 182, 212, 0.1)' : undefined, // 拖曳時的背景色 (Cyan tint)
-    opacity: isDragging ? 0.3 : 1, // 拖曳時變半透明 (Placeholder 效果)
-    border: isDragging ? '1px dashed #22d3ee' : undefined, // 拖曳時的虛線框
+    backgroundColor: isDragging ? 'rgba(6, 182, 212, 0.1)' : undefined,
+    opacity: isDragging ? 0.3 : 1,
+    border: isDragging ? '1px dashed #22d3ee' : undefined,
     zIndex: isDragging ? 999 : 'auto',
   };
 
@@ -85,10 +91,10 @@ const SortableHeader = ({ id, children }) => {
       style={style}
       {...attributes}
       {...listeners}
-      className="px-6 py-4 font-semibold select-none relative hover:bg-white/5 transition-colors group"
+      // 🔥 修改這裡：加上 whitespace-nowrap
+      className="px-6 py-4 font-semibold select-none relative hover:bg-white/5 transition-colors group whitespace-nowrap"
     >
       {children}
-      {/* 懸停時顯示拖曳手柄提示 */}
       <span className="absolute right-2 top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-50 text-[10px] text-cyan-400">⋮⋮</span>
     </th>
   );
@@ -215,8 +221,8 @@ const ChartRenderer = ({ data, type, title }) => {
 };
 
 // 🟢 新增：支援 D&D 排序的表格容器
+// 🟢 完整覆蓋 DraggableTable 元件
 const DraggableTable = ({ children }) => {
-  // 1. 解析 ReactMarkdown 傳來的 children，分離出 thead 和 tbody
   const childrenArray = React.Children.toArray(children);
   const thead = childrenArray.find(c => c.type === 'thead');
   const tbody = childrenArray.find(c => c.type === 'tbody');
@@ -228,17 +234,14 @@ const DraggableTable = ({ children }) => {
     return 'Column';
   };
 
-  // 2. 取得原始欄位名稱 (從 thead 裡挖出來)
   const initialHeaders = React.Children.map(thead?.props?.children?.props?.children, child => {
     return extractText(child);
   }) || [];
 
-  // 3. 初始化排序狀態 (優先讀取 localStorage)
   const [columns, setColumns] = useState(() => {
     const saved = localStorage.getItem('tableColumnOrder');
     if (saved) {
       const savedCols = JSON.parse(saved);
-      // 防呆：如果儲存的欄位跟現在不一致(例如換了問題)，就重置
       if (savedCols.length === initialHeaders.length && savedCols.every(c => initialHeaders.includes(c))) {
         return savedCols;
       }
@@ -246,17 +249,14 @@ const DraggableTable = ({ children }) => {
     return initialHeaders;
   });
 
-  // 當表格內容改變 (AI 生成新回應) 時，重置 columns
   useEffect(() => {
     if (initialHeaders.length > 0 && JSON.stringify(initialHeaders) !== JSON.stringify(columns)) {
-      // 簡單處理：內容變了就用新的 Header，若要保留排序需做更複雜的 merge 邏輯
       setColumns(initialHeaders);
     }
   }, [thead]);
 
-  // 4. 設定感應器 (Pointer: 滑鼠/觸控, Keyboard: 鍵盤輔助)
   const sensors = useSensors(
-    useSensor(PointerSensor, { activationConstraint: { distance: 8 } }), // 移動 8px 才觸發拖曳，避免誤觸點擊
+    useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates })
   );
 
@@ -267,44 +267,74 @@ const DraggableTable = ({ children }) => {
         const oldIndex = items.indexOf(active.id);
         const newIndex = items.indexOf(over.id);
         const newOrder = arrayMove(items, oldIndex, newIndex);
-        localStorage.setItem('tableColumnOrder', JSON.stringify(newOrder)); // 💾 保存排序結果
+        localStorage.setItem('tableColumnOrder', JSON.stringify(newOrder));
         return newOrder;
       });
     }
   };
 
-  // 建立原始 header 的索引映射，用於稍後重新排列 body 的 cell
   const originalHeaderIndexMap = initialHeaders.reduce((acc, col, idx) => ({ ...acc, [col]: idx }), {});
 
   return (
     <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
-      <div className="overflow-x-auto my-6 rounded-xl border border-slate-700/50 shadow-lg bg-slate-900/90">
-        <table className="min-w-full text-left text-sm border-collapse">
-          <thead className="bg-cyan-900/30 text-cyan-300 font-bold uppercase tracking-wider text-xs border-b border-white/10">
-            <SortableContext items={columns} strategy={horizontalListSortingStrategy}>
-              <tr>
-                {columns.map((col) => (
-                  <SortableHeader key={col} id={col}>{col}</SortableHeader>
-                ))}
-              </tr>
-            </SortableContext>
-          </thead>
-          <tbody className="text-slate-300 divide-y divide-white/5">
-            {React.Children.map(tbody?.props?.children, (row) => {
-              // row 是 <tr>, row.props.children 是 <td> 陣列
-              const cells = React.Children.toArray(row.props.children);
-              return (
-                <tr className="hover:bg-white/5 transition-colors duration-200">
-                  {columns.map((col, newIndex) => {
-                    // 根據目前的 column 順序，去抓原始資料對應的 cell
-                    const originalIndex = originalHeaderIndexMap[col];
-                    return cells[originalIndex] || <td key={newIndex} className="px-6 py-4">-</td>;
-                  })}
+      {/* 🔥 關鍵修改 1：容器層級限制
+         1. display: grid -> 這是防止 flex item 被子元素撐開的絕招。
+         2. w-full max-w-full -> 強制寬度不超過父層 (對話氣泡)。
+         3. my-6 -> 上下邊距。
+      */}
+      <div className="grid w-full max-w-full my-6">
+
+        {/* 🔥 關鍵修改 2：滾動視窗層
+           1. overflow-auto -> 同時開啟 X 軸與 Y 軸滾動。
+           2. max-h-[500px] -> 限制高度，超過出 Y 軸卷軸。
+           3. w-full -> 繼承 grid 的寬度。
+           4. rounded/border/shadow -> 樣式美化。
+        */}
+        <div className="w-full overflow-auto max-h-[500px] rounded-xl border border-slate-700/50 shadow-lg bg-slate-900/90 custom-scrollbar">
+
+          {/* 🔥 關鍵修改 3：表格實體
+             1. w-max -> 這是核心！"Width Max Content"。
+                它告訴表格：「你的寬度 = 所有欄位加起來的總寬度」。
+                因為外層 div 限制了寬度，所以當 table > div 時，卷軸就會出現。
+          */}
+          <table className="w-max min-w-full text-left text-sm border-separate border-spacing-0">
+
+            {/* Sticky Header: 固定在容器頂部 */}
+            <thead className="sticky top-0 z-20 bg-slate-900 text-cyan-300 font-bold uppercase tracking-wider text-xs shadow-md">
+              <SortableContext items={columns} strategy={horizontalListSortingStrategy}>
+                <tr>
+                  {columns.map((col) => (
+                    <SortableHeader key={col} id={col}>
+                      {/* 強制不換行，撐開寬度 */}
+                      <span className="whitespace-nowrap px-2">{col}</span>
+                    </SortableHeader>
+                  ))}
                 </tr>
-              );
-            })}
-          </tbody>
-        </table>
+              </SortableContext>
+            </thead>
+
+            <tbody className="text-slate-300 divide-y divide-white/5">
+              {React.Children.map(tbody?.props?.children, (row) => {
+                const cells = React.Children.toArray(row.props.children);
+                return (
+                  <tr className="hover:bg-white/5 transition-colors duration-200">
+                    {columns.map((col, newIndex) => {
+                      const originalIndex = originalHeaderIndexMap[col];
+                      return cells[originalIndex] ? (
+                        // 強制每個儲存格都不換行
+                        React.cloneElement(cells[originalIndex], {
+                          className: "px-6 py-4 whitespace-nowrap"
+                        })
+                      ) : (
+                        <td key={newIndex} className="px-6 py-4 whitespace-nowrap text-slate-500 italic">-</td>
+                      );
+                    })}
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
       </div>
     </DndContext>
   );
@@ -376,30 +406,30 @@ const MarkdownRenderer = ({ content }) => {
         // 2. 表格 (Draggable Table)
         // ==========================================
         table: DraggableTable,
-        td: ({ children }) => <td className="px-6 py-4">{children}</td>,
+        td: ({ children }) => <td className="px-6 py-4 whitespace-nowrap">{children}</td>,
 
         // ==========================================
         // 🟢 3. 段落 (P) - 這裡加入了「出處高亮」功能
         // ==========================================
         p: ({ children }) => {
-          // 如果內容不是純文字，就直接渲染原本的樣子
-          if (!children || (Array.isArray(children) && children.some(c => typeof c !== 'string'))) {
+          // 1. 判斷是否為「純文字」或「純文字陣列」
+          const isPureString = typeof children === 'string';
+          const isStringArray = Array.isArray(children) && children.every(c => typeof c === 'string');
+
+          // 2. 如果包含非文字的元素（例如 LaTeX 公式物件、圖片、粗體等），直接回傳原始內容，不做處理
+          if (!isPureString && !isStringArray) {
             return <p className="mb-4 last:mb-0 leading-7">{children}</p>;
           }
 
-          // 將內容轉成字串來處理
+          // 3. 只有確認是純文字，才執行原本的「出處高亮」邏輯
           const text = Array.isArray(children) ? children.join('') : String(children);
-
-          // 使用 Regex 切割字串：找到 (出處: ...) 的部分
-          // 格式範例：(出處: 勞基法.pdf)
           const parts = text.split(/(\(出處:.*?\))/g);
 
           return (
             <p className="mb-4 last:mb-0 leading-7">
               {parts.map((part, index) => {
-                // 如果這段文字是「出處標籤」，就給它 Neon 樣式
                 if (part.startsWith('(出處:') && part.endsWith(')')) {
-                  const content = part.replace(/[()]/g, ''); // 去掉括號
+                  const content = part.replace(/[()]/g, '');
                   return (
                     <span key={index} className="inline-flex items-center gap-1 mx-1 text-cyan-400 text-xs font-bold tracking-wide select-none hover:text-cyan-300 transition-colors cursor-help hover:underline underline-offset-2">
                       <Paperclip size={8} />
@@ -407,13 +437,11 @@ const MarkdownRenderer = ({ content }) => {
                     </span>
                   );
                 }
-                // 不是標籤，就顯示普通文字
                 return part;
               })}
             </p>
           );
         },
-
         // ==========================================
         // 4. 其他基本標籤樣式
         // ==========================================
@@ -435,7 +463,12 @@ const MarkdownRenderer = ({ content }) => {
         ),
       }}
     >
-      {content.replace(/\\\[/g, '$$').replace(/\\\]/g, '$$').replace(/\\\(/g, '$').replace(/\\\)/g, '$')}
+      {content
+        .replace(/\\\[/g, '$$')  // 把 \[ 換成 $$ (區塊公式)
+        .replace(/\\\]/g, '$$')
+        .replace(/\\\(/g, '$')   // 把 \( 換成 $ (行內公式)
+        .replace(/\\\)/g, '$')
+      }
     </ReactMarkdown>
   );
 };
@@ -473,7 +506,7 @@ const ConnectionErrorModal = ({ message, onClose }) => (
 );
 
 function App() {
-  const API_BASE = "http://127.0.0.1:8000";
+  const API_BASE = "http://127.0.0.1:8000/api";
   const defaultMessage = {
     role: "AI",
     content: "💠 **SYSTEM ONLINE.**\n\nThere!我是 Chroma AI，請上傳資料以開始駭入分析。💾"
@@ -495,12 +528,74 @@ function App() {
   });
 
   const [input, setInput] = useState("");
-  const [isLoading, setIsLoading] = useState(false);
+  const [loadingSessionId, setLoadingSessionId] = useState(null);
+  const currentSessionIdRef = useRef(currentSessionId);
   const [uploadStatus, setUploadStatus] = useState("");
   const [availableModels, setAvailableModels] = useState(["gpt-oss:20b"]);
   const [selectedModel, setSelectedModel] = useState("gpt-oss:20b");
   const [filesToUpload, setFilesToUpload] = useState([]);
   const [errorModal, setErrorModal] = useState({ show: false, message: "" });
+
+  const [fileList, setFileList] = useState([]);          // 儲存從後端抓來的檔案清單
+  const [viewingFile, setViewingFile] = useState(null);  // 目前正在檢視哪個檔案 (null 代表沒開)
+  const [viewContent, setViewContent] = useState("");    // 該檔案的文字內容
+  const [loadingFiles, setLoadingFiles] = useState(false); // 是否正在讀取列表
+
+  // 📂 檔案管理邏輯 (File Management Logic)
+
+  // 📥 1. 抓取檔案列表
+  const fetchFileList = async () => {
+    setLoadingFiles(true);
+    try {
+      // 呼叫後端 GET /files
+      const response = await axios.get(`${API_BASE}/files`);
+      setFileList(response.data.files);
+    } catch (error) {
+      console.error("無法取得檔案列表", error);
+    } finally {
+      setLoadingFiles(false);
+    }
+  };
+
+  // 🗑️ 2. 刪除檔案
+  const handleDeleteFile = async (e, filename) => {
+    e.stopPropagation(); // 防止誤觸其他點擊事件
+    if (!window.confirm(`確定要永久刪除 "${filename}" 嗎？`)) return;
+
+    try {
+      await axios.delete(`${API_BASE}/files/${encodeURIComponent(filename)}`);
+
+      // 刪除成功後，重新抓取列表以更新畫面
+      await fetchFileList();
+
+      // (選擇性) 讓 AI 在對話框通知使用者
+      setMessages(prev => [...prev, {
+        role: "AI",
+        content: `🗑️ **FILE DELETED**\n\n已移除檔案核心：\`${filename}\``
+      }]);
+    } catch (error) {
+      alert("刪除失敗，請檢查後端連線");
+      console.error(error);
+    }
+  };
+
+  // 👁️ 3. 檢視檔案 (直接開新分頁)
+  const handleViewFile = (filename) => {
+    // 透過 encodeURIComponent 處理中文檔名
+    const fileUrl = `${API_BASE}/files/${encodeURIComponent(filename)}/view`;
+
+    // 🔥 在新分頁打開該網址
+    window.open(fileUrl, '_blank');
+  };
+
+  // 🔄 4. 初始化：畫面載入時自動抓一次列表
+  useEffect(() => {
+    fetchFileList();
+  }, []);
+
+  useEffect(() => {
+    currentSessionIdRef.current = currentSessionId;
+  }, [currentSessionId]);
 
   // 🟢 新增：聊天圖片相關狀態
   const chatImageInputRef = useRef(null);
@@ -510,6 +605,7 @@ function App() {
   const chatEndRef = useRef(null);
   const textareaRef = useRef(null);
   const abortControllerRef = useRef(null);
+  const typingIntervalRef = useRef(null);
 
   // 🟢 自動清除舊資料
   useEffect(() => {
@@ -537,17 +633,27 @@ function App() {
     autoPurge();
   }, []);
 
-  // 🟢 自動抓取模型清單
+  // 🟢 自動抓取模型清單 (修正版：自動過濾 embedding 模型)
   useEffect(() => {
     const fetchModels = async () => {
       try {
+        // 1. 呼叫 API
         const response = await axios.get(`${API_BASE}/models`);
-        const models = response.data.models;
 
-        if (models && models.length > 0) {
-          setAvailableModels(models);
-          if (!models.includes(selectedModel)) {
-            setSelectedModel(models[0]);
+        // 2. 取得原始資料
+        const rawModels = response.data.models;
+
+        // 3. ✨ 關鍵修正：過濾掉名字包含 "embed" 的模型
+        const modelNames = rawModels
+          .map(model => model.name)
+          .filter(name => !name.toLowerCase().includes('embed')); // 👈 加上這行過濾器
+
+        if (modelNames && modelNames.length > 0) {
+          setAvailableModels(modelNames);
+
+          // 防呆：如果當前選中的模型是被過濾掉的 (例如 nomic-embed)，自動切換回正常的第一個模型
+          if (!modelNames.includes(selectedModel)) {
+            setSelectedModel(modelNames[0]);
           }
         }
       } catch (error) {
@@ -555,14 +661,15 @@ function App() {
       }
     };
     fetchModels();
-  }, []);
+  }, []); // 空陣列代表只在掛載時執行一次
 
+  // 🟢 修正後的自動捲動 (依賴 messages 和 loadingSessionId)
   useEffect(() => {
     requestAnimationFrame(() => {
       if (!chatEndRef.current) return;
       chatEndRef.current.scrollIntoView({ behavior: "smooth", block: "end" });
     });
-  }, [isLoading]);
+  }, [messages, loadingSessionId]);
 
   useEffect(() => {
     if (textareaRef.current) {
@@ -594,10 +701,10 @@ function App() {
 
   const createNewChat = () => {
     // 1. 如果正在等待 AI 回覆 (isLoading 為 true)，先不要讓使用者開新對話，避免中斷連線
-    if (isLoading) {
+    /*if (isLoading) {
       alert("請等待 AI 回覆完成後再開啟新對話。");
       return;
-    }
+    }*/
 
     // 2. 建立一個全新的 Session 物件
     const newSession = {
@@ -676,20 +783,29 @@ function App() {
   const handleUpload = async () => {
     if (filesToUpload.length === 0) return;
     setUploadStatus("🚀 UPLOADING...");
+
     const formData = new FormData();
     filesToUpload.forEach((file) => formData.append("files", file));
+
     try {
       const response = await axios.post(`${API_BASE}/upload`, formData, {
         headers: { "Content-Type": "multipart/form-data" },
       });
-      const { processed_files } = response.data;
+
+      const { processed } = response.data;
       setUploadStatus(`✨ SYNC COMPLETE`);
+
+      // 🔥 關鍵修改：上傳成功後，立刻重新抓取檔案列表
+      fetchFileList();
+
       setMessages(prev => [...prev, {
         role: "AI",
-        content: `🎉 **DATA INJECTED**\n\n成功載入 **${processed_files.length}** 份文件核心。`
+        content: `🎉 **DATA INJECTED**\n\n成功載入 **${processed ? processed.length : 0}** 份文件核心。`
       }]);
+
       setFilesToUpload([]);
       setTimeout(() => setUploadStatus(""), 3000);
+
     } catch (error) {
       console.error(error);
       setUploadStatus("");
@@ -698,15 +814,43 @@ function App() {
   };
 
   const handleReset = async () => {
+    if (!window.confirm("確定要清空所有對話紀錄與知識庫嗎？此動作無法復原。")) return; // 建議加上防呆確認
+
+    // A. 切斷網路連線
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+    // B. 殺死打字機迴圈
+    if (typingIntervalRef.current) {
+      clearInterval(typingIntervalRef.current);
+      typingIntervalRef.current = null;
+    }
+    // C. 清除讀取狀態
+    setLoadingSessionId(null);
+
     try {
-      await axios.post("http://127.0.0.1:8000/reset");
+      // 呼叫後端重置 API
+      await axios.post(`${API_BASE}/reset`); // 建議改用 API_BASE 變數，比較乾淨
+      // 如果你的環境沒有 API_BASE，就維持 "http://127.0.0.1:8000/api/reset"
+
       const resetMsg = { role: "AI", content: "🧹 **SYSTEM PURGED**\n記憶體與資料庫已強制格式化。" };
+
+      // 1. 重置對話
       setMessages([resetMsg]);
       setSessions([{ id: Date.now(), title: "New Session", messages: [resetMsg], createdAt: Date.now() }]);
       localStorage.removeItem("chatSessions");
+
+      // 2. 重置上傳區塊
       setUploadStatus("");
       setFilesToUpload([]);
+
+      // 🔥 3. 【關鍵修改】同步清空左側檔案列表
+      setFileList([]);
+      // 這樣使用者就不會看到「幽靈檔案」，也不會誤點導致 404 錯誤
+
     } catch (error) {
+      console.error(error);
       setErrorModal({ show: true, message: "Reset Protocol Failed" });
     }
   };
@@ -716,7 +860,7 @@ function App() {
       abortControllerRef.current.abort();
       abortControllerRef.current = null;
     }
-    setIsLoading(false);
+    setLoadingSessionId(null);
     setMessages((prev) => {
       const newMessages = [...prev];
       const lastIndex = newMessages.length - 1;
@@ -763,52 +907,47 @@ function App() {
   };
 
   const handleSendMessage = async (e) => {
+    // 1. 按鍵判斷
     if (e && e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
     } else if (e && (e.key !== "Enter" || e.shiftKey)) {
       return;
     }
+
+    // 檢查是否有輸入
     if (!input.trim() && chatImages.length === 0) return;
 
+    const targetSessionId = currentSessionId;
     const userMsgContent = input;
+
+    // 2. 準備訊息物件
     const userMessage = {
       role: "User",
       content: userMsgContent,
-      images: chatImages.map(img => img.url) // 存預覽圖供顯示
+      images: chatImages.map(img => img.url)
     };
+    const aiPlaceholder = { role: "AI", content: "", sources: [], isTyping: true };
 
-    // 1. 先顯示使用者的訊息，並預留一個 AI 的空位
-    setMessages((prev) => [
-      ...prev,
-      userMessage,
-      { role: "AI", content: "", sources: [], isTyping: true }
-    ]);
+    // 3. 更新畫面 (Session 資料庫 & 前景)
+    setSessions(prev => prev.map(session => {
+      if (session.id === targetSessionId) {
+        return { ...session, messages: [...session.messages, userMessage, aiPlaceholder] };
+      }
+      return session;
+    }));
 
+    if (currentSessionIdRef.current === targetSessionId) {
+      setMessages(prev => [...prev, userMessage, aiPlaceholder]);
+    }
+
+    // 4. 準備發送 payload
     const imagesPayload = chatImages.map(img => img.base64);
     setChatImages([]);
     setInput("");
-    setIsLoading(true);
+    setLoadingSessionId(targetSessionId); // 🟢 開始轉圈圈
+
     const controller = new AbortController();
     abortControllerRef.current = controller;
-
-    let effectiveModel = selectedModel;
-
-    /*if (chatImages.length > 0) {
-      // 如果有圖片，嘗試從 availableModels 裡找一個能看圖的模型
-      // 搜尋順序：Llava -> MiniCPM -> Moondream
-      const visualModel = availableModels.find(m => m.includes("llava")) ||
-        availableModels.find(m => m.includes("minicpm")) ||
-        availableModels.find(m => m.includes("moondream"));
-
-      if (visualModel) {
-        // ✅ 找到了！(例如找到 "llava:latest")，直接使用它
-        effectiveModel = visualModel;
-      } else {
-        // ❌ 找不到任何已知的視覺模型，只好硬帶 "llava" 碰運氣，並警告使用者
-        effectiveModel = "llava";
-        alert("⚠️ 系統偵測到圖片，但找不到已安裝的視覺模型 (Llava/MiniCPM/Moondream)。請確認 Ollama 設定。");
-      }
-    }*/
 
     try {
       const response = await fetch(`${API_BASE}/chat`, {
@@ -816,82 +955,116 @@ function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           query: userMsgContent,
-          model_name: effectiveModel,
+          model_name: selectedModel,
+          history: messages,
           images: imagesPayload
         }),
         signal: controller.signal,
       });
 
-      if (!response.ok) throw new Error("Network response was not ok");
+      if (!response.ok) throw new Error(`Network error: ${response.status}`);
 
       const sourcesHeader = response.headers.get("X-Sources");
       const sources = sourcesHeader ? JSON.parse(sourcesHeader) : [];
+
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
 
-      let fullRawText = "";      // 倉庫：存放從網路收到的一大包完整文字
-      let displayedText = "";    // 舞台：目前已經顯示在螢幕上的文字
-      let netWorkDone = false;   // 標記：網路下載是否結束
+      // 🔥 變數準備：生產者與消費者共享的變數
+      let fullRawText = "";   // 【倉庫】後端傳來的所有文字
+      let displayedText = ""; // 【貨架】目前顯示在螢幕上的文字
+      let isStreamDone = false; // 標記：網路傳輸是否結束
 
-      // 啟動一個計時器，負責「一點一點」把字畫上去
-      const typingInterval = setInterval(() => {
+      // ==========================================
+      // 🟢 消費者：打字機特效迴圈 (每 30ms 執行一次)
+      // ==========================================
+      typingIntervalRef.current = setInterval(() => {
+        // 算出還有多少字沒顯示
+        const remainingChars = fullRawText.length - displayedText.length;
 
-        if (displayedText.length < fullRawText.length) {
-          const chunkSize = API_CONFIG.CHUNK_SIZE;
-          const nextChunk = fullRawText.slice(displayedText.length, displayedText.length + chunkSize);
+        if (remainingChars > 0) {
+          // 🔥 動態加速邏輯：
+          // 如果剩餘字數很多 (>100)，每次就多吐一點 (例如剩 500 字，除以 20，一次吐 25 字)
+          // 如果剩餘字數很少，就維持最少 2 個字，保持打字感
+          // 這樣既能快速顯示長文，又能保留結尾的打字特效
+          const dynamicChunk = Math.max(2, Math.floor(remainingChars / 20));
+
+          const nextChunk = fullRawText.slice(displayedText.length, displayedText.length + dynamicChunk);
           displayedText += nextChunk;
 
-          setMessages((prev) => {
-            const newMessages = [...prev];
-            const lastIndex = newMessages.length - 1;
-            if (lastIndex >= 0 && newMessages[lastIndex].role === "AI") {
-              newMessages[lastIndex] = {
-                ...newMessages[lastIndex],
-                content: displayedText,
-                sources: sources,
-                isTyping: true
-              };
+          // 更新 Session 資料庫 (背景)
+          setSessions(prevSessions => prevSessions.map(session => {
+            if (session.id === targetSessionId) {
+              const newMsgs = [...session.messages];
+              const lastIdx = newMsgs.length - 1;
+              if (lastIdx >= 0 && newMsgs[lastIdx].role === "AI") {
+                newMsgs[lastIdx] = {
+                  ...newMsgs[lastIdx],
+                  content: displayedText,
+                  sources: sources,
+                  isTyping: true
+                };
+              }
+              return { ...session, messages: newMsgs };
             }
-            return newMessages;
-          });
-        }
-        else if (netWorkDone && displayedText.length >= fullRawText.length) {
-          clearInterval(typingInterval);
-          setIsLoading(false);
-          setMessages((prev) => {
-            const newMessages = [...prev];
-            const lastIndex = newMessages.length - 1;
-            if (lastIndex >= 0 && newMessages[lastIndex].role === "AI") {
-              newMessages[lastIndex] = {
-                ...newMessages[lastIndex],
-                isTyping: false
-              };
-            }
-            return newMessages;
-          });
-        }
-      }, API_CONFIG.TYPING_SPEED);
+            return session;
+          }));
 
-      // 網路接收迴圈 (只負責收貨，不負責顯示)
+          // 更新目前畫面 (前景)
+          if (currentSessionIdRef.current === targetSessionId) {
+            setMessages(prev => {
+              const newMessages = [...prev];
+              const lastIndex = newMessages.length - 1;
+              if (lastIndex >= 0 && newMessages[lastIndex].role === "AI") {
+                newMessages[lastIndex] = {
+                  ...newMessages[lastIndex],
+                  content: displayedText,
+                  sources: sources,
+                  isTyping: true
+                };
+              }
+              return newMessages;
+            });
+          }
+        }
+        // 🛑 停止條件
+        else if (isStreamDone) {
+          clearInterval(typingIntervalRef.current);
+          setLoadingSessionId(null);
+
+          const finalizeMessage = (msgs) => {
+            const newMsgs = [...msgs];
+            const lastIdx = newMsgs.length - 1;
+            if (lastIdx >= 0) newMsgs[lastIdx] = { ...newMsgs[lastIdx], isTyping: false };
+            return newMsgs;
+          };
+
+          setSessions(prev => prev.map(s => s.id === targetSessionId ? { ...s, messages: finalizeMessage(s.messages) } : s));
+          if (currentSessionIdRef.current === targetSessionId) {
+            setMessages(prev => finalizeMessage(prev));
+          }
+        }
+      }, 50);
+
+      // ==========================================
+      // 🔵 生產者：網路接收迴圈 (負責填滿倉庫)
+      // ==========================================
       while (true) {
         const { value, done } = await reader.read();
         if (done) {
-          netWorkDone = true;
+          isStreamDone = true; // 告訴打字機：貨補完了，印完就可以下班了
           break;
         }
-        const chunkValue = decoder.decode(value || new Uint8Array(), { stream: true });
-        fullRawText += chunkValue;
+        // 只負責解碼並塞入 fullRawText，不負責更新 UI
+        fullRawText += decoder.decode(value, { stream: true });
       }
 
     } catch (error) {
-      if (error.name === 'AbortError') {
-        console.log("Transmission aborted by user.");
-      } else {
-        console.error(error);
-        setMessages(prev => prev.slice(0, -1));
-        setErrorModal({ show: true, message: "Stream Connection Severed" });
+      if (error.name !== 'AbortError') {
+        console.error("❌ 串流錯誤:", error);
+        setErrorModal({ show: true, message: "Stream Connection Failed" });
       }
-      setIsLoading(false);
+      setLoadingSessionId(null);
     } finally {
       abortControllerRef.current = null;
     }
@@ -901,14 +1074,6 @@ function App() {
     <div className="flex items-center justify-center h-screen w-screen bg-[#0f0c29] font-sans overflow-hidden relative selection:bg-fuchsia-500 selection:text-white text-slate-800">
       <CyberpunkNeonBackground />
       <div className="relative z-10 w-[90vw] h-[90vh] max-w-[1400px] flex rounded-[40px] overflow-hidden shadow-[0_0_50px_rgba(217,70,239,0.2)] border border-white/20 bg-white/10 backdrop-blur-2xl">
-        <AnimatePresence>
-          {errorModal.show && (
-            <ConnectionErrorModal
-              message={errorModal.message}
-              onClose={() => setErrorModal({ show: false, message: "" })}
-            />
-          )}
-        </AnimatePresence>
         <div className="w-80 min-w-[300px] bg-slate-900/60 backdrop-blur-xl flex flex-col p-6 text-white relative border-r border-white/10">
           <div className="mb-8 flex items-center justify-between">
             <div className="flex items-center gap-3">
@@ -1040,6 +1205,50 @@ function App() {
                   {uploadStatus}
                 </motion.div>
               )}
+              <div className="mt-4 pt-4 border-t border-white/10">
+                <div className="flex items-center justify-between mb-2 px-1">
+                  <label className="text-[10px] font-bold text-emerald-400 uppercase tracking-widest flex items-center gap-2">
+                    <FileText size={10} /> Knowledge Base ({fileList.length})
+                  </label>
+                  <button onClick={fetchFileList} className="text-slate-500 hover:text-cyan-400 transition-colors" title="Refresh">
+                    <RefreshCw size={10} className={loadingFiles ? "animate-spin" : ""} />
+                  </button>
+                </div>
+
+                <div className="flex-1 overflow-y-auto custom-scrollbar space-y-1 pr-1 max-h-[150px]">
+                  {fileList.length === 0 ? (
+                    <p className="text-center text-[10px] text-slate-600 py-4 italic">No data injected yet.</p>
+                  ) : (
+                    <AnimatePresence>
+                      {fileList.map((file) => (
+                        <motion.div
+                          key={file}
+                          initial={{ opacity: 0, x: -10 }}
+                          animate={{ opacity: 1, x: 0 }}
+                          exit={{ opacity: 0, height: 0 }}
+                          className="group flex items-center justify-between p-2 rounded-lg bg-slate-800/30 border border-transparent hover:border-emerald-500/30 hover:bg-slate-800/80 transition-all cursor-pointer"
+                          onClick={() => handleViewFile(file)}
+                        >
+                          <div className="flex items-center gap-2 min-w-0">
+                            <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 shadow-[0_0_5px_#10b981]" />
+                            <span className="text-[11px] text-slate-300 truncate font-mono max-w-[140px]" title={file}>
+                              {file}
+                            </span>
+                          </div>
+
+                          <button
+                            onClick={(e) => handleDeleteFile(e, file)}
+                            className="opacity-0 group-hover:opacity-100 p-1.5 rounded hover:bg-red-500/20 text-slate-500 hover:text-red-400 transition-all"
+                            title="Delete"
+                          >
+                            <Trash2 size={12} />
+                          </button>
+                        </motion.div>
+                      ))}
+                    </AnimatePresence>
+                  )}
+                </div>
+              </div>
             </div>
           </div>
           <div className="pt-4 mt-auto">
@@ -1122,7 +1331,7 @@ function App() {
               );
             })}
 
-            {isLoading && (
+            {loadingSessionId === currentSessionId && (
               <ThinkingBubble
                 content={messages.find(m => m.role === 'AI' && m.isTyping)?.content || ""}
               />
@@ -1161,26 +1370,6 @@ function App() {
 
               <div className="relative flex items-center gap-3 bg-white/90 backdrop-blur-2xl rounded-3xl p-2 pl-4 shadow-[0_10px_30px_-5px_rgba(6,182,212,0.2)] border border-white">
 
-                {/* <motion.button
-                  whileHover={{ scale: 1.1 }}
-                  whileTap={{ scale: 0.9 }}
-                  onClick={() => chatImageInputRef.current.click()}
-                  className="p-2 rounded-full text-slate-400 hover:bg-slate-100 hover:text-cyan-500 transition-all"
-                  title="Upload Image"
-                >
-                  <ImageIcon size={20} />
-                </motion.button>
-                
-                <input
-                  ref={chatImageInputRef}
-                  type="file"
-                  className="hidden"
-                  accept="image/*"
-                  multiple
-                  onChange={handleChatImageSelect}
-                />
-                */}
-
                 <textarea
                   ref={textareaRef}
                   value={input}
@@ -1194,15 +1383,16 @@ function App() {
                 <motion.button
                   whileHover={{ scale: 1.05 }}
                   whileTap={{ scale: 0.95 }}
-                  onClick={() => isLoading ? handleStop() : handleSendMessage()}
-                  // 🟢 修改：允許只傳圖片 (當 input 為空但有圖片時，按鈕依然可用)
-                  disabled={!input.trim() && chatImages.length === 0 && !isLoading}
-                  className={`p-3 rounded-full text-white shadow-lg transition-all self-end ${isLoading
+                  onClick={() => loadingSessionId === currentSessionId ? handleStop() : handleSendMessage()}
+                  // 🟢 修正：檢查 loadingSessionId 而不是 isLoading
+                  disabled={!input.trim() && chatImages.length === 0 && loadingSessionId !== currentSessionId}
+                  className={`p-3 rounded-full text-white shadow-lg transition-all self-end ${loadingSessionId === currentSessionId
                     ? "bg-gradient-to-r from-red-500 to-orange-500 hover:shadow-red-500/30 cursor-pointer"
                     : "bg-gradient-to-r from-fuchsia-600 to-cyan-600 hover:shadow-cyan-500/30 disabled:opacity-50 disabled:cursor-not-allowed"
                     }`}
                 >
-                  {isLoading ? (
+                  {/* 🟢 修正：檢查 loadingSessionId 而不是 isLoading */}
+                  {loadingSessionId === currentSessionId ? (
                     <Square size={20} className="fill-current animate-pulse" />
                   ) : (
                     <Send size={20} />
@@ -1216,63 +1406,51 @@ function App() {
           </div>
         </div>
       </div>
-      <style jsx global>{`
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
-        body { font-family: 'Inter', sans-serif; }
-        .custom-scrollbar::-webkit-scrollbar { width: 4px; }
-        .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
-        .custom-scrollbar::-webkit-scrollbar-thumb { background: rgba(217, 70, 239, 0.2); border-radius: 10px; }
-        .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: rgba(6, 182, 212, 0.4); }
-        
-        @keyframes grid-move {
-            0% { transform: translateY(0); }
-            100% { transform: translateY(60px); }
-        }
-        .animate-grid-move { animation: grid-move 2s linear infinite; }
+      <AnimatePresence>
+        {viewingFile && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4"
+            onClick={() => setViewingFile(null)}
+          >
+            <motion.div
+              initial={{ scale: 0.9, y: 20 }}
+              animate={{ scale: 1, y: 0 }}
+              exit={{ scale: 0.9, y: 20 }}
+              className="bg-slate-900 border border-cyan-500/50 w-full max-w-3xl max-h-[80vh] rounded-2xl shadow-[0_0_50px_rgba(6,182,212,0.2)] flex flex-col overflow-hidden"
+              onClick={e => e.stopPropagation()}
+            >
+              {/* Header */}
+              <div className="flex items-center justify-between p-4 border-b border-white/10 bg-slate-800/50">
+                <div className="flex items-center gap-2 text-cyan-400">
+                  <FileText size={20} />
+                  <h3 className="font-bold text-lg truncate max-w-md">{viewingFile}</h3>
+                </div>
+                <button
+                  onClick={() => setViewingFile(null)}
+                  className="p-2 hover:bg-white/10 rounded-full transition-colors text-slate-400 hover:text-white"
+                >
+                  <X size={20} />
+                </button>
+              </div>
 
-        @keyframes scanline {
-            0% { top: 0%; opacity: 0; }
-            50% { opacity: 1; }
-            100% { top: 100%; opacity: 0; }
-        }
-        .animate-scanline { animation: scanline 4s linear infinite; }
+              {/* Content */}
+              <div className="flex-1 overflow-y-auto p-6 custom-scrollbar bg-[#0f0c29]">
+                <pre className="whitespace-pre-wrap font-mono text-sm text-slate-300 leading-relaxed">
+                  {viewContent}
+                </pre>
+              </div>
 
-        .animate-pulse-slow { animation: pulse 6s ease-in-out infinite; }
-
-        @keyframes scanline-fast {
-            0% { transform: translateY(-100%); }
-            100% { transform: translateY(100%); }
-        }
-
-        .animate-scanline-fast {
-            animation: scanline-fast 1.5s linear infinite;
-        }
-
-        @keyframes blink {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0; }
-        }
-
-        .animate-blink {
-            animation: blink 1s step-end infinite;
-        }
-
-        @keyframes shimmer {
-            0% { transform: translateX(-100%); }
-            100% { transform: translateX(300%); }
-        }
-        .animate-shimmer {
-            animation: shimmer 2s infinite linear;
-        }
-
-        @keyframes fadeIn {
-            from { opacity: 0; transform: translateY(10px); }
-            to { opacity: 1; transform: translateY(0); }
-        }
-        .animate-fade-in {
-            animation: fadeIn 0.3s ease-out forwards;
-        }
-      `}</style>
+              {/* Footer */}
+              <div className="p-3 border-t border-white/10 bg-slate-800/50 text-right text-xs text-slate-500">
+                SOURCE CONTENT VIEWER v1.0
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }

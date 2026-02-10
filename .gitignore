@@ -9,3 +9,5 @@ node_modules/
 *.pyc
 *.db
 package-lock.json
+
+chroma_db/

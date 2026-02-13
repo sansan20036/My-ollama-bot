@@ -1,13 +1,26 @@
-# Python 暫存檔
-**/__pycache__/
+# ========================
+# Backend (Python)
+# ========================
+venv/
+__pycache__/
 *.pyc
+chroma_db/
+data/
+.idea/
+.run/
+*.db
 
-# 資料庫檔案
-**/chroma_db/
-*.sqlite3
-
-# Node.js 套件
+# ========================
+# Frontend (Node.js/React)
+# ========================
 node_modules/
-
-# 系統檔案
+build/
+dist/
 .DS_Store
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*

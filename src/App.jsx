@@ -950,6 +950,8 @@ function App() {
     abortControllerRef.current = controller;
 
     try {
+      // 🔥 修改這裡：增加 keepalive 屬性 (雖然對 POST 幫助有限，但可嘗試)
+      // 重點其實是後端處理時間。
       const response = await fetch(`${API_BASE}/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -960,9 +962,14 @@ function App() {
           images: imagesPayload
         }),
         signal: controller.signal,
+        // keepalive: true, // ⚠️ 注意：keepalive 通常用於背景請求，對長時間串流可能會有反效果，先不加
       });
 
-      if (!response.ok) throw new Error(`Network error: ${response.status}`);
+      if (!response.ok) {
+        // 🔥 增加更詳細的錯誤訊息處理
+        const errorText = await response.text();
+        throw new Error(`Network error: ${response.status} - ${errorText}`);
+      }
 
       const sourcesHeader = response.headers.get("X-Sources");
       const sources = sourcesHeader ? JSON.parse(sourcesHeader) : [];

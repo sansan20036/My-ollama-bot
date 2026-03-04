@@ -11,12 +11,9 @@ import httpx
 # 引入服務
 from app.services.chat_service import ChatService
 from app.services.vector_store import VectorStoreService
-from app.services.file_service import FileLoaderFactory
 from app.core.config import settings
-
-# 引入 LangChain 切割器
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_core.documents import Document
+# 新增：把我們寫好的背景表格提煉引擎引進來
+from app.services.file_service import extract_and_save_tables
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -24,7 +21,7 @@ logger = logging.getLogger(__name__)
 # 初始化服務
 chat_service = ChatService()
 
-# 🔥 設定檔案儲存目錄 (請確保此資料夾存在)
+#  設定檔案儲存目錄
 UPLOAD_DIR = os.path.join(os.getcwd(), "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
@@ -37,15 +34,12 @@ class Message(BaseModel):
 
 class ChatRequest(BaseModel):
     query: str
-    model_name: str = "llama3.2"
+    model_name: str = "gpt-oss:20b"
     history: List[Message] = []
     images: List[str] = []
 
 
-# ==========================================
 # 1. 聊天與模型相關 API
-# ==========================================
-
 @router.post("/chat")
 async def chat_endpoint(request: ChatRequest):
     """對話 API (包含歷史紀錄改寫)"""
@@ -64,7 +58,7 @@ async def chat_endpoint(request: ChatRequest):
 async def get_models():
     """從 Ollama 伺服器動態抓取模型列表"""
     try:
-        base_url = getattr(settings, "OLLAMA_BASE_URL", "http://localhost:11434")
+        base_url = getattr(settings, "OLLAMA_BASE_URL", "http://git.tedpc.com.tw:11434/api/tags")
         target_url = f"{base_url}/api/tags"
 
         async with httpx.AsyncClient() as client:
@@ -76,12 +70,11 @@ async def get_models():
                 return {"models": []}
     except Exception as e:
         logger.error(f"無法連線到 Ollama: {str(e)}")
+        # 回傳預設值防止前端壞掉
         return {"models": [{"name": "gpt-oss:20b", "details": {"parameter_size": "20B"}}]}
 
 
-# ==========================================
 # 2. 檔案管理 API (CRUD & View)
-# ==========================================
 
 @router.get("/files")
 async def list_files():
@@ -97,7 +90,7 @@ async def list_files():
 
 @router.get("/files/{filename}/view")
 async def view_file(filename: str):
-    """🔥 讓瀏覽器直接預覽檔案 (PDF, 圖片等)"""
+    """讓瀏覽器直接預覽檔案 (PDF, 圖片等)"""
     file_path = os.path.join(UPLOAD_DIR, filename)
 
     if not os.path.exists(file_path):
@@ -115,13 +108,15 @@ async def view_file(filename: str):
         media_type = "image/png"
     elif lower_name.endswith(".txt"):
         media_type = "text/plain"
+    elif lower_name.endswith((".py", ".js", ".html", ".css", ".json", ".md")):
+        media_type = "text/plain"  # 程式碼也當文字看
 
     return FileResponse(file_path, media_type=media_type, filename=filename, content_disposition_type="inline")
 
 
 @router.get("/files/{filename}/content")
 async def view_file_content(filename: str):
-    """檢視檔案內容 (純文字模式，保留給舊功能或 Debug 用)"""
+    """檢視檔案內容 (純文字模式，從 VectorStore 拼湊回來)"""
     try:
         vs = VectorStoreService.get_instance()
         content = vs.get_file_content(filename)
@@ -141,6 +136,12 @@ async def delete_file(filename: str):
 
         # 2. 刪除實體檔案 (如果存在)
         file_path = os.path.join(UPLOAD_DIR, filename)
+
+        # 🔥 新增：連同可能產生的 CSV 快取一起刪除
+        csv_path = file_path.rsplit('.', 1)[0] + "_tables.csv"
+        if os.path.exists(csv_path):
+            os.remove(csv_path)
+
         if os.path.exists(file_path):
             os.remove(file_path)
             logger.info(f"實體檔案 {filename} 已刪除")
@@ -148,6 +149,9 @@ async def delete_file(filename: str):
         if success:
             return {"status": "success", "message": f"File {filename} deleted"}
         else:
+            # 即使資料庫沒找到，只要檔案刪了也算成功
+            if os.path.exists(file_path) == False:
+                return {"status": "success", "message": f"File {filename} deleted (was not in DB)"}
             raise HTTPException(status_code=404, detail="File not found in database")
     except HTTPException as he:
         raise he
@@ -183,47 +187,45 @@ async def reset_database():
 
 @router.post("/upload")
 async def upload_files(files: List[UploadFile] = File(...)):
-    """檔案上傳與處理"""
+    """
+    修改：檔案上傳與處理
+    改用 vector_store.process_file 來觸發 Smart Parsing
+    """
     try:
         vs = VectorStoreService.get_instance()
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=3000, chunk_overlap=300)
         processed_files = []
         error_files = []
 
         for file in files:
-            # 🔥 修改：直接存到 uploads 資料夾
             file_path = os.path.join(UPLOAD_DIR, file.filename)
 
             try:
-                # 1. 永久儲存檔案 (為了預覽與時間戳記)
+                # 1. 永久儲存檔案
                 with open(file_path, "wb") as buffer:
                     shutil.copyfileobj(file.file, buffer)
 
-                # 2. 解析檔案
-                loader = FileLoaderFactory.get_loader(file_path, file.filename)
-                raw_text = loader.extract_text()
+                # 檔案儲存後，若為 PDF，立刻在背景提煉表格
+                if file_path.lower().endswith(".pdf"):
+                    extract_and_save_tables(file_path)
 
-                if not raw_text:
-                    logger.warning(f"檔案 {file.filename} 無文字內容，跳過")
-                    error_files.append(file.filename)
-                    continue
+                # 2. 呼叫 process_file (這裡會去跑 SmartFileParser)
+                await vs.process_file(file_path)
 
-                # 3. 切割與向量化
-                chunks = text_splitter.split_text(raw_text)
-                docs = [Document(page_content=c, metadata={"source": file.filename}) for c in chunks]
-
-                if docs:
-                    vs.add_documents(docs)
-                    processed_files.append(file.filename)
+                processed_files.append(file.filename)
 
             except Exception as e:
                 logger.error(f"處理失敗 {file.filename}: {e}")
                 error_files.append(file.filename)
 
+                # 如果處理失敗，順便把殘留檔案刪掉
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+
         return {
             "status": "success",
             "processed": processed_files,
-            "errors": error_files
+            "errors": error_files,
+            "message": f"成功處理 {len(processed_files)} 個檔案，結構化解析完成。"
         }
 
     except Exception as e:

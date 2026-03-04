@@ -15,8 +15,7 @@ class Settings(BaseSettings):
     # 向量與 Embedding 設定
     EMBEDDING_MODEL: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
-    # 自動計算路徑 (這就是為什麼我們要有這個檔案)
-    # BASE_DIR 會自動抓到 app 資料夾的上一層 (也就是專案根目錄)
+    # 自動計算路徑:BASE_DIR 會自動抓到 app 資料夾的上一層 (也就是專案根目錄)
     BASE_DIR: str = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
     # 資料庫與上傳路徑

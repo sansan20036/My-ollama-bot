@@ -16,7 +16,7 @@ class SemanticCacheService:
         logger.info(f"🔄 正在初始化語意快取: {settings.CACHE_DB_DIR}")
         self.embeddings = HuggingFaceEmbeddings(model_name=settings.EMBEDDING_MODEL)
 
-        # 注意：這裡用不同的 persist_directory 和 collection_name
+        # 這裡用不同的 persist_directory 和 collection_name
         self.db = Chroma(
             collection_name="semantic_cache",
             persist_directory=settings.CACHE_DB_DIR,

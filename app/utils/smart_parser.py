@@ -88,8 +88,7 @@ class SmartFileParser:
 
     def _parse_law(self, text: str, filename: str) -> list[Document]:
         """
-        🔥 V2.0 修正版：嚴格切割
-        只抓取位於「行首」或「換行後」的第X條，避免抓到內文引用的條號
+        修正版：嚴格切割: 只抓取位於「行首」或「換行後」的第X條，避免抓到內文引用的條號
         """
         # Regex 解釋：
         # (?:\n|^)  -> 非捕獲群組：必須是字串開頭 (^) 或是換行符號 (\n)

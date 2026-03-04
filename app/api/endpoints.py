@@ -12,10 +12,8 @@ import httpx
 from app.services.chat_service import ChatService
 from app.services.vector_store import VectorStoreService
 from app.core.config import settings
-
-#  移除舊的 LangChain 切割器引用 (因為已經封裝進 process_file 了)
-# from langchain_text_splitters import RecursiveCharacterTextSplitter
-# from langchain_core.documents import Document
+# 新增：把我們寫好的背景表格提煉引擎引進來
+from app.services.file_service import extract_and_save_tables
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -23,7 +21,7 @@ logger = logging.getLogger(__name__)
 # 初始化服務
 chat_service = ChatService()
 
-# 🔥 設定檔案儲存目錄
+#  設定檔案儲存目錄
 UPLOAD_DIR = os.path.join(os.getcwd(), "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
@@ -41,10 +39,7 @@ class ChatRequest(BaseModel):
     images: List[str] = []
 
 
-# ==========================================
 # 1. 聊天與模型相關 API
-# ==========================================
-
 @router.post("/chat")
 async def chat_endpoint(request: ChatRequest):
     """對話 API (包含歷史紀錄改寫)"""
@@ -63,7 +58,7 @@ async def chat_endpoint(request: ChatRequest):
 async def get_models():
     """從 Ollama 伺服器動態抓取模型列表"""
     try:
-        base_url = getattr(settings, "OLLAMA_BASE_URL", "http://localhost:11434")
+        base_url = getattr(settings, "OLLAMA_BASE_URL", "http://git.tedpc.com.tw:11434/api/tags")
         target_url = f"{base_url}/api/tags"
 
         async with httpx.AsyncClient() as client:
@@ -79,9 +74,7 @@ async def get_models():
         return {"models": [{"name": "gpt-oss:20b", "details": {"parameter_size": "20B"}}]}
 
 
-# ==========================================
 # 2. 檔案管理 API (CRUD & View)
-# ==========================================
 
 @router.get("/files")
 async def list_files():
@@ -97,7 +90,7 @@ async def list_files():
 
 @router.get("/files/{filename}/view")
 async def view_file(filename: str):
-    """🔥 讓瀏覽器直接預覽檔案 (PDF, 圖片等)"""
+    """讓瀏覽器直接預覽檔案 (PDF, 圖片等)"""
     file_path = os.path.join(UPLOAD_DIR, filename)
 
     if not os.path.exists(file_path):
@@ -143,6 +136,12 @@ async def delete_file(filename: str):
 
         # 2. 刪除實體檔案 (如果存在)
         file_path = os.path.join(UPLOAD_DIR, filename)
+
+        # 🔥 新增：連同可能產生的 CSV 快取一起刪除
+        csv_path = file_path.rsplit('.', 1)[0] + "_tables.csv"
+        if os.path.exists(csv_path):
+            os.remove(csv_path)
+
         if os.path.exists(file_path):
             os.remove(file_path)
             logger.info(f"實體檔案 {filename} 已刪除")
@@ -189,7 +188,7 @@ async def reset_database():
 @router.post("/upload")
 async def upload_files(files: List[UploadFile] = File(...)):
     """
-    🔥 核心修改：檔案上傳與處理
+    修改：檔案上傳與處理
     改用 vector_store.process_file 來觸發 Smart Parsing
     """
     try:
@@ -205,8 +204,11 @@ async def upload_files(files: List[UploadFile] = File(...)):
                 with open(file_path, "wb") as buffer:
                     shutil.copyfileobj(file.file, buffer)
 
-                # 2. 🔥 呼叫 process_file (這裡會去跑 SmartFileParser)
-                # 這是最關鍵的一步！
+                # 檔案儲存後，若為 PDF，立刻在背景提煉表格
+                if file_path.lower().endswith(".pdf"):
+                    extract_and_save_tables(file_path)
+
+                # 2. 呼叫 process_file (這裡會去跑 SmartFileParser)
                 await vs.process_file(file_path)
 
                 processed_files.append(file.filename)
@@ -214,6 +216,7 @@ async def upload_files(files: List[UploadFile] = File(...)):
             except Exception as e:
                 logger.error(f"處理失敗 {file.filename}: {e}")
                 error_files.append(file.filename)
+
                 # 如果處理失敗，順便把殘留檔案刪掉
                 if os.path.exists(file_path):
                     os.remove(file_path)

@@ -51,7 +51,7 @@ class VectorStoreService:
 
     async def process_file(self, file_path: str):
         """
-        🔥 核心流程：讀取 -> 智慧解析 -> 儲存
+        核心流程：讀取 -> 智慧解析 -> 儲存
         """
         try:
             # 避免循環引用，在函式內 import
@@ -67,7 +67,7 @@ class VectorStoreService:
                 logger.warning(f"⚠️ 檔案 {filename} 無內容或無法讀取，跳過處理")
                 return
 
-            # 2. 🔥 啟動 SmartFileParser 進行結構化解析
+            # 2.啟動 SmartFileParser 進行結構化解析
             logger.info(f"🧠 啟動 SmartFileParser 解析檔案: {filename}")
             parser = SmartFileParser()
 
@@ -159,14 +159,14 @@ class VectorStoreService:
                 sorted_docs = [doc for doc, meta in sorted_combined]
             except:
                 sorted_docs = documents
-
             return "\n\n-------------------\n\n".join(sorted_docs)
+
         except Exception as e:
             logger.error(f"讀取檔案內容失敗: {e}")
             return f"讀取錯誤: {str(e)}"
 
     def reset(self):
-        """🔥 強制清空資料庫 (Purge System)"""
+        """強制清空資料庫 (Purge System)"""
         try:
             # 1. 嘗試從 Chroma 刪除所有資料
             all_ids = self.db.get()['ids']

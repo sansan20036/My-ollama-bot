@@ -5,6 +5,7 @@ import logging
 from typing import List
 from fastapi import APIRouter, UploadFile, File, HTTPException
 from fastapi.responses import StreamingResponse, FileResponse
+from app.models.schemas import ChatRequest, Message
 from pydantic import BaseModel
 import httpx
 
@@ -26,27 +27,16 @@ UPLOAD_DIR = os.path.join(os.getcwd(), "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
-# 定義 Request Schema
-class Message(BaseModel):
-    role: str
-    content: str
-
-
-class ChatRequest(BaseModel):
-    query: str
-    model_name: str = "gpt-oss:20b"
-    history: List[Message] = []
-    images: List[str] = []
-
-
 # 1. 聊天與模型相關 API
 @router.post("/chat")
 async def chat_endpoint(request: ChatRequest):
     """對話 API (包含歷史紀錄改寫)"""
     try:
         history_data = [m.model_dump() for m in request.history]
+
+        # 把前端傳來的 Base64 圖片陣列一起送進大腦
         return StreamingResponse(
-            chat_service.process_query(request.query, history_data),
+            chat_service.process_query(request.query, history_data, request.images),
             media_type="text/plain"
         )
     except Exception as e:
@@ -58,20 +48,25 @@ async def chat_endpoint(request: ChatRequest):
 async def get_models():
     """從 Ollama 伺服器動態抓取模型列表"""
     try:
-        base_url = getattr(settings, "OLLAMA_BASE_URL", "http://git.tedpc.com.tw:11434/api/tags")
+        # 修正 1：確保 base_url 只包含主機與 Port，不要有後面的路徑
+        base_url = getattr(settings, "OLLAMA_BASE_URL", "http://git.tedpc.com.tw:11434")
+
+        # 修正 2：移除網址結尾可能的斜線，確保拼接正確
+        base_url = base_url.rstrip('/')
         target_url = f"{base_url}/api/tags"
 
         async with httpx.AsyncClient() as client:
-            response = await client.get(target_url, timeout=5.0)
+            # 修正 3：將 timeout 稍微拉長，避免遠端網路延遲導致誤判
+            response = await client.get(target_url, timeout=10.0)
             if response.status_code == 200:
                 return response.json()
             else:
-                logger.error(f"Ollama 回應錯誤: {response.status_code}")
+                logger.error(f"Ollama 回應錯誤: {response.status_code} - {response.text}")
                 return {"models": []}
     except Exception as e:
         logger.error(f"無法連線到 Ollama: {str(e)}")
-        # 回傳預設值防止前端壞掉
-        return {"models": [{"name": "gpt-oss:20b", "details": {"parameter_size": "20B"}}]}
+        # 建議：測試階段先不要寫死假資料，讓它回傳空陣列，這樣你前端或 Log 才看得出真的斷線了
+        return {"models": []}
 
 
 # 2. 檔案管理 API (CRUD & View)
@@ -137,7 +132,7 @@ async def delete_file(filename: str):
         # 2. 刪除實體檔案 (如果存在)
         file_path = os.path.join(UPLOAD_DIR, filename)
 
-        # 🔥 新增：連同可能產生的 CSV 快取一起刪除
+        # 連同可能產生的 CSV 快取一起刪除
         csv_path = file_path.rsplit('.', 1)[0] + "_tables.csv"
         if os.path.exists(csv_path):
             os.remove(csv_path)
@@ -180,7 +175,7 @@ async def reset_database():
                 except Exception as e:
                     logger.error(f"Failed to delete {file_path}: {e}")
 
-        return {"message": "✅ 系統記憶與檔案已完全重置"}
+        return {"message": " 系統記憶與檔案已完全重置"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

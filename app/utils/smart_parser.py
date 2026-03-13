@@ -3,7 +3,7 @@ import re
 import unicodedata
 from langchain_core.documents import Document
 
-# 🔥 萬能引用區塊
+# 萬能引用區塊
 try:
     from langchain_text_splitters import RecursiveCharacterTextSplitter, Language
 except ImportError:
@@ -23,7 +23,7 @@ except ImportError:
         try:
             from langchain.text_splitter import RecursiveCharacterTextSplitter
         except ImportError:
-            raise ImportError("❌ 嚴重錯誤：找不到 langchain 文字切割模組。")
+            raise ImportError("嚴重錯誤：找不到 langchain 文字切割模組。")
 
 
 class SmartFileParser:

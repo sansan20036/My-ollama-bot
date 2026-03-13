@@ -31,18 +31,18 @@ def extract_and_save_tables(pdf_path: str):
     all_data = []
 
     try:
-        logger.info(f"⚙️ [背景任務] 正在掃描 {os.path.basename(pdf_path)} 是否包含表格...")
+        logger.info(f"[背景任務] 正在掃描 {os.path.basename(pdf_path)} 是否包含表格...")
         with pdfplumber.open(pdf_path) as pdf:
             for page in pdf.pages:
-                # 🛡️ 第一道粗篩：連 4 條線都沒有的純文字，直接跳過
+                # 第一道粗篩：連 4 條線都沒有的純文字，直接跳過
                 if len(page.lines) < 4 and len(page.rects) < 1:
                     continue
 
-                # 🛡️ 第二道精篩：利用 find_tables() 尋找真實網格，排除裝飾線
+                # 第二道精篩：利用 find_tables() 尋找真實網格，排除裝飾線
                 if not page.find_tables():
                     continue
 
-                # ⚔️ 確定有表格結構，才啟動文字萃取
+                # 確定有表格結構，才啟動文字萃取
                 tables = page.extract_tables()
                 for table in tables:
                     for row in table:
@@ -54,19 +54,33 @@ def extract_and_save_tables(pdf_path: str):
         # 如果有抓到表格資料，就把它存成 CSV 備用
         if len(all_data) > 1:
             df = pd.DataFrame(all_data[1:], columns=all_data[0])
+            # 1. 將全部都是空白的字串轉換為真正的 NaN
+            df.replace(r'^\s*$', np.nan, regex=True, inplace=True)
+            # 2. 刪除「整行」或「整列」全是 NaN 的垃圾資料
+            df.dropna(how='all', axis=1, inplace=True)
+            df.dropna(how='all', axis=0, inplace=True)
+
+            # 3. 如果清洗完發現整個表格空了 (代表這是被誤判的圖表)，就放棄處理
+            if df.empty or len(df.columns) == 0:
+                logger.info(" [背景任務] 清洗後發現為無效表格(如長條圖誤判)，已捨棄。")
+                return False
+            null_ratio = df.isna().sum().sum() / df.size
+            if null_ratio > 0.5:
+                logger.info(f" [背景任務] 表格空值率高達 {null_ratio:.1%}，判定為圖表誤判，已捨棄。")
+                return False
             df = df[df.iloc[:, 0].astype(str).str.strip() != ""]
-            df.columns = [re.split(r'[\s\n(]', str(col))[0] for col in df.columns]
+            df.columns = [re.split(r'[\s\n(]', str(col))[0] if pd.notna(col) else "Column" for col in df.columns]
 
             # 存成 CSV (使用 utf-8-sig 確保 Excel 打開不會亂碼)
             df.to_csv(csv_path, index=False, encoding='utf-8-sig')
-            logger.info(f"✅ [背景任務] 提煉成功！已產生表格快取: {os.path.basename(csv_path)}")
+            logger.info(f"[背景任務] 提煉成功！已產生表格快取: {os.path.basename(csv_path)}")
             return True
         else:
-            logger.info("ℹ️ [背景任務] 此 PDF 無表格，標記為純文字檔。")
+            logger.info(" [背景任務] 此 PDF 無表格，標記為純文字檔。")
             return False
 
     except Exception as e:
-        logger.error(f"⚠️ [背景任務] 表格提煉失敗: {e}")
+        logger.error(f" [背景任務] 表格提煉失敗: {e}")
         return False
 
 
@@ -90,7 +104,7 @@ class PDFFileLoader(FileLoader):
             # 初始化 OCR 引擎 (第一次跑會自動載入模型)
             ocr = RapidOCR()
 
-            logger.info(f"🔍 開始解析 PDF (啟用 OCR 雙重防護): {self.original_filename}")
+            logger.info(f" 開始解析 PDF (啟用 OCR 雙重防護): {self.original_filename}")
 
             for i, page in enumerate(doc):
                 # 1. 先嘗試正規文字提取
@@ -99,7 +113,7 @@ class PDFFileLoader(FileLoader):
                 # 2. 判斷是否為亂碼 (如果文字長度大於 20，但包含大量怪符號，或是像空空如也)
                 # 設定一個簡單的機制：如果抽出來的字不到 50 個字，或是包含特殊亂碼特徵，就強制啟用 OCR
                 if len(page_text) < 50 or "cid:" in page_text or "MNOP" in page_text:
-                    logger.warning(f"⚠️ 第 {i + 1} 頁偵測到亂碼或空文字，啟動 OCR 視覺提取...")
+                    logger.warning(f" 第 {i + 1} 頁偵測到亂碼或空文字，啟動 OCR 視覺提取...")
 
                     # 將 PDF 該頁渲染成圖片 (dpi=150 足以辨識文字且不會太慢)
                     pix = page.get_pixmap(dpi=150)
@@ -188,37 +202,57 @@ class ExcelFileLoader(FileLoader):
 class ImageFileLoader(FileLoader):
     def extract_text(self) -> str:
         try:
-            model_name = "minicpm-v"
-
-            logger.info(f"🖼️ 開始處理圖片: {self.original_filename}，呼叫模型: {model_name}...")
+            model_name = "llama3.2-vision:11b"
+            logger.info(f"開始處理圖片: {self.original_filename}...")
 
             with open(self.file_path, "rb") as f:
                 img_bytes = f.read()
 
-            # 驗證圖片有效性
-            Image.open(io.BytesIO(img_bytes)).verify()
+            # 1. 啟動 RapidOCR 先行暴力抓字！
+            ocr_text = "(無明顯文字)"
+            try:
+                ocr = RapidOCR()
+                # 讀取圖片給 OCR
+                img_array = cv2.imread(self.file_path)
+                result, _ = ocr(img_array)
+                if result:
+                    ocr_text = "\n".join([line[1] for line in result])
+                    logger.info(f" 圖片 OCR 預先辨識成功: {ocr_text}")
+            except Exception as e:
+                logger.warning(f"圖片 OCR 輔助失敗: {e}")
 
-            # 準備 Payload
+            # 2. 將 OCR 抓到的字，當作作弊小抄交給 AI
+            target_url = getattr(settings, "OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip('/') + "/api/chat"
+
+            # 修改 Prompt，把 OCR 結果塞進去
+            enhanced_prompt = f"""You are an expert image analysis AI.
+            The image contains the following text extracted by an OCR tool:
+            [OCR TEXT START]
+            {ocr_text}
+            [OCR TEXT END]
+            
+            Please describe the humor, context, and visual elements of this image in Traditional Chinese (繁體中文). Use the OCR text to help you understand the meme."""
+
             response = requests.post(
-                "http://git.tedpc.com.tw:11434/api/tags",
+                target_url,
                 json={
                     "model": model_name,
-                    # 強化 Prompt：明確要求它讀出圖片裡的文字
-                    "prompt": "請詳細描述這張圖片。如果圖片中有「文字」，請務必將文字內容完整抄寫出來。請用繁體中文回答。",
-                    "images": [base64.b64encode(img_bytes).decode('utf-8')],
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": enhanced_prompt,
+                            "images": [base64.b64encode(img_bytes).decode('utf-8')]
+                        }
+                    ],
                     "stream": False,
-                    "options": {
-                        "temperature": 0.1,  # 低溫模式，減少幻覺
-                        "num_predict": 1024  # 給它足夠的長度寫字
-                    }
+                    "options": {"temperature": 0.1, "num_predict": 1024}
                 },
-                # 延長超時：大模型看圖比較慢，給它 300 秒
                 timeout=300
             )
 
             if response.status_code == 200:
-                result = response.json().get('response', '')
-                logger.info(f"✅ 圖片分析完成: {self.original_filename}")
+                result = response.json().get('message', {}).get('content', '')
+                logger.info(f"圖片分析完成: {self.original_filename}")
                 return f"【圖片: {self.original_filename}】\nAI ({model_name}) 視覺分析與文字提取結果：\n{result}\n"
 
             return f"【圖片: {self.original_filename}】(分析失敗 Status: {response.status_code})\n"
@@ -261,7 +295,7 @@ class FileService:
             with open(file_path, "wb") as buffer:
                 shutil.copyfileobj(file.file, buffer)
 
-            logger.info(f"✅ 檔案已儲存: {file.filename}")
+            logger.info(f"檔案已儲存: {file.filename}")
 
             # 檔案儲存後，若為 PDF，立刻在背景提煉表格
             if file_path.lower().endswith(".pdf"):
@@ -293,7 +327,7 @@ class FileService:
                 shutil.rmtree(self.upload_dir)
                 os.makedirs(self.upload_dir)
                 self.vector_store.reset()
-                logger.info("🗑️ 系統已清空")
+                logger.info("系統已清空")
             return True
         except Exception as e:
             logger.error(f"清空失敗: {e}")

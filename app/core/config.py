@@ -10,7 +10,7 @@ class Settings(BaseSettings):
 
     # Ollama 連線設定
     OLLAMA_BASE_URL: str = "http://git.tedpc.com.tw:11434"
-    OLLAMA_MODEL: str = "gpt-oss:20b"
+    OLLAMA_MODEL: str = "gemma3:26b"
 
     # 向量與 Embedding 設定
     EMBEDDING_MODEL: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"

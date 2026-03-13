@@ -13,7 +13,7 @@ class SemanticCacheService:
     _instance = None
 
     def __init__(self):
-        logger.info(f"🔄 正在初始化語意快取: {settings.CACHE_DB_DIR}")
+        logger.info(f"正在初始化語意快取: {settings.CACHE_DB_DIR}")
         self.embeddings = HuggingFaceEmbeddings(model_name=settings.EMBEDDING_MODEL)
 
         # 這裡用不同的 persist_directory 和 collection_name
@@ -39,7 +39,7 @@ class SemanticCacheService:
             doc, score = results[0]
             if score < self.threshold:
                 elapsed = time.time() - start_time
-                logger.info(f"⚡ [Cache Hit] 命中快取! (距離: {score:.4f} | 耗時: {elapsed:.4f}s)")
+                logger.info(f"[Cache Hit] 命中快取! (距離: {score:.4f} | 耗時: {elapsed:.4f}s)")
                 return doc.page_content
 
         return None
@@ -51,4 +51,4 @@ class SemanticCacheService:
         self.db.add_documents([
             Document(page_content=answer, metadata={"question": query})
         ])
-        logger.info(f"💾 [Cache Update] 已將問答寫入快取")
+        logger.info(f" [Cache Update] 已將問答寫入快取")

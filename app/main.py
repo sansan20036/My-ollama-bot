@@ -21,14 +21,14 @@ UPLOAD_DIR = os.path.join(os.getcwd(), "uploads")
 async def lifespan(app: FastAPI):
 
     # 啟動時執行：強制清空所有資料
-    logger.info("🚀 系統啟動中... 準備執行強制環境初始化 (PURGE)")
+    logger.info("系統啟動中... 準備執行強制環境初始化 (PURGE)")
 
     try:
         # 1. 無情清空硬碟裡的上傳資料夾 (刪除所有舊的 PDF 等檔案)
         if os.path.exists(UPLOAD_DIR):
             shutil.rmtree(UPLOAD_DIR)  # 把整個資料夾連同裡面的檔案拔掉
         os.makedirs(UPLOAD_DIR, exist_ok=True)  # 重新建立一個乾淨的空資料夾
-        logger.info("🗑️ [大掃除] 已清空本機上傳檔案資料夾")
+        logger.info("[大掃除] 已清空本機上傳檔案資料夾")
 
         # 2. 清空 ChromaDB 向量資料庫
         vs = VectorStoreService.get_instance()
@@ -36,21 +36,21 @@ async def lifespan(app: FastAPI):
         # 假設VectorStoreService 有 reset() 函數可以清空資料庫
         if hasattr(vs, 'reset'):
             vs.reset()
-            logger.info("🗑️ [大掃除] 已重置向量資料庫 (ChromaDB)")
+            logger.info("[大掃除] 已重置向量資料庫 (ChromaDB)")
         else:
             # 備用方案：如果沒有 reset 函數，就逐一刪除清單內的檔案
             db_files = vs.list_sources()
             for filename in db_files:
                 vs.delete_file(filename)
-            logger.info(f"🗑️ [大掃除] 已逐一刪除 {len(db_files)} 筆資料庫紀錄")
+            logger.info(f" [大掃除] 已逐一刪除 {len(db_files)} 筆資料庫紀錄")
 
     except Exception as e:
-        logger.error(f"⚠️ [大掃除] 清理舊資料時發生錯誤: {e}")
-    logger.info("✅ 系統啟動完成，目前為 100% 乾淨的全新狀態！")
+        logger.error(f" [大掃除] 清理舊資料時發生錯誤: {e}")
+    logger.info(" 系統啟動完成，目前為 100% 乾淨的全新狀態！")
     yield  # 這裡代表伺服器正在運作中...
 
     #關閉時執行
-    logger.info("🛑 系統關閉")
+    logger.info(" 系統關閉")
 
 
 # 建立 App

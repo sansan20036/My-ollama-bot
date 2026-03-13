@@ -44,9 +44,9 @@ class VectorStoreService:
             try:
                 # ChromaDB 的 add_documents 會自動處理 ID 和向量化
                 self.db.add_documents(docs)
-                logger.info(f"📥 成功存入 {len(docs)} 筆向量資料片段")
+                logger.info(f"成功存入 {len(docs)} 筆向量資料片段")
             except Exception as e:
-                logger.error(f"❌ 存入向量資料庫失敗: {e}")
+                logger.error(f"存入向量資料庫失敗: {e}")
                 raise e
 
     async def process_file(self, file_path: str):
@@ -64,11 +64,11 @@ class VectorStoreService:
             text_content = loader.extract_text()
 
             if not text_content:
-                logger.warning(f"⚠️ 檔案 {filename} 無內容或無法讀取，跳過處理")
+                logger.warning(f"檔案 {filename} 無內容或無法讀取，跳過處理")
                 return
 
             # 2.啟動 SmartFileParser 進行結構化解析
-            logger.info(f"🧠 啟動 SmartFileParser 解析檔案: {filename}")
+            logger.info(f" 啟動 SmartFileParser 解析檔案: {filename}")
             parser = SmartFileParser()
 
             # 這會回傳一系列帶有豐富 metadata (如 article_id, type) 的 Document 物件
@@ -77,12 +77,12 @@ class VectorStoreService:
             # 3. 存入資料庫
             if docs:
                 self.add_documents(docs)
-                logger.info(f"✅ 檔案 '{filename}' 處理完成，共存入 {len(docs)} 筆結構化資料")
+                logger.info(f"檔案 '{filename}' 處理完成，共存入 {len(docs)} 筆結構化資料")
             else:
-                logger.warning(f"⚠️ 檔案 '{filename}' 解析後無有效資料片段")
+                logger.warning(f"檔案 '{filename}' 解析後無有效資料片段")
 
         except Exception as e:
-            logger.error(f"❌ 處理檔案失敗 {file_path}: {e}")
+            logger.error(f"處理檔案失敗 {file_path}: {e}")
             raise e
     # 定義搜尋動作的地方
     def search(self, query: str, k: int = 4, filter: Optional[Dict[str, Any]] = None):
@@ -130,10 +130,10 @@ class VectorStoreService:
             if ids:
                 # 2. 根據 ID 刪除
                 self.db.delete(ids)
-                logger.info(f"🗑️ 已刪除檔案 '{filename}'，共移除 {len(ids)} 筆向量片段")
+                logger.info(f"已刪除檔案 '{filename}'，共移除 {len(ids)} 筆向量片段")
                 return True
             else:
-                logger.warning(f"⚠️ 找不到檔案 '{filename}' 的資料")
+                logger.warning(f"找不到檔案 '{filename}' 的資料")
                 return False
         except Exception as e:
             logger.error(f"刪除檔案失敗: {e}")
@@ -176,12 +176,12 @@ class VectorStoreService:
                 for i in range(0, len(all_ids), batch_size):
                     batch_ids = all_ids[i:i + batch_size]
                     self.db.delete(batch_ids)
-                logger.info(f"🗑️ 已從 Chroma 刪除 {len(all_ids)} 筆資料")
+                logger.info(f"️已從 Chroma 刪除 {len(all_ids)} 筆資料")
 
             # 2. 重新初始化
             self.db = None
             self._init_db()
-            logger.info("✅ 資料庫重置完成")
+            logger.info("資料庫重置完成")
 
         except Exception as e:
             logger.error(f"Reset failed: {e}")

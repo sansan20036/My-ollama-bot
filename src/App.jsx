@@ -28,7 +28,7 @@ import {
 } from "lucide-react";
 
 const API_CONFIG = {
-  BASE_URL: "http://127.0.0.1:8000/api",
+  BASE_URL: "http://127.0.0.1:8000/api/models",
   TYPING_SPEED: 50,      // 打字速度 (毫秒)
   CHUNK_SIZE: 1,         // 每次吐幾個字
   TIMEOUT: 500,          // 停止打字後的延遲
@@ -512,14 +512,18 @@ function App() {
     content: "💠 **SYSTEM ONLINE.**\n\nThere!我是 Chroma AI，請上傳資料以開始駭入分析。💾"
   };
 
+  // 加上這個共用的初始 ID
+  const initId = Date.now();
+
   const [sessions, setSessions] = useState(() => {
     const saved = localStorage.getItem("chatSessions");
-    return saved ? JSON.parse(saved) : [{ id: Date.now(), title: "New Session", messages: [defaultMessage], createdAt: Date.now() }];
+    return saved ? JSON.parse(saved) : [{ id: initId, title: "New Session", messages: [defaultMessage], createdAt: initId }];
   });
 
   const [currentSessionId, setCurrentSessionId] = useState(() => {
     const savedSessions = JSON.parse(localStorage.getItem("chatSessions") || "[]");
-    return savedSessions.length > 0 ? savedSessions[0].id : null;
+    // 如果找不到紀錄，就用上面宣告的 initId，不要回傳 null！
+    return savedSessions.length > 0 ? savedSessions[0].id : initId;
   });
 
   const [messages, setMessages] = useState(() => {
@@ -531,8 +535,8 @@ function App() {
   const [loadingSessionId, setLoadingSessionId] = useState(null);
   const currentSessionIdRef = useRef(currentSessionId);
   const [uploadStatus, setUploadStatus] = useState("");
-  const [availableModels, setAvailableModels] = useState(["gpt-oss:20b"]);
-  const [selectedModel, setSelectedModel] = useState("gpt-oss:20b");
+  const [availableModels, setAvailableModels] = useState(["gemma3:27b"]);
+  const [selectedModel, setSelectedModel] = useState("gemma3:27b");
   const [filesToUpload, setFilesToUpload] = useState([]);
   const [errorModal, setErrorModal] = useState({ show: false, message: "" });
 
@@ -635,7 +639,7 @@ function App() {
           const initSession = {
             id: Date.now(),
             title: "New Session",
-            messages: [{ role: "AI", content: "♻️ **SYSTEM REBOOTED**\n偵測到伺服器已重啟，前端記憶與資料庫已同步清除。請重新上傳檔案。" }],
+            messages: [{ role: "AI", content: "♻️ **SYSTEM REBOOTED**\n偵測到伺服器已重啟，請重新上傳檔案。" }],
             createdAt: Date.now()
           };
 
@@ -754,763 +758,785 @@ function App() {
 
     // 清空圖片暫存
     setChatImages([]);
+  };
 
-    const switchSession = (sessionId) => {
-      // 1. 先把「當前」的對話紀錄存回 sessions 陣列 (Auto-save)
-      // 雖然 useEffect 已經有做 sync，但手動切換時再防呆一次
-      setSessions(prevSessions => prevSessions.map(s =>
-        s.id === currentSessionId ? { ...s, messages: messages } : s
-      ));
+  const switchSession = (sessionId) => {
+    // 1. 先把「當前」的對話紀錄存回 sessions 陣列 (Auto-save)
+    // 雖然 useEffect 已經有做 sync，但手動切換時再防呆一次
+    setSessions(prevSessions => prevSessions.map(s =>
+      s.id === currentSessionId ? { ...s, messages: messages } : s
+    ));
 
-      // 2. 找出目標 Session
-      const targetSession = sessions.find(s => s.id === sessionId);
+    // 2. 找出目標 Session
+    const targetSession = sessions.find(s => s.id === sessionId);
 
-      if (targetSession) {
-        // 3. 切換 ID
-        setCurrentSessionId(sessionId);
-        // 4. 載入目標 Session 的訊息到畫面上
-        setMessages(targetSession.messages);
-        // 5. 清空圖片暫存 (因為換房間了)
-        setChatImages([]);
-      }
-    };
-
-    const deleteSession = (e, sessionId) => {
-      e.stopPropagation();
-      const newSessions = sessions.filter(s => s.id !== sessionId);
-      setSessions(newSessions);
-      localStorage.setItem("chatSessions", JSON.stringify(newSessions));
-      if (sessionId === currentSessionId) {
-        if (newSessions.length > 0) {
-          setCurrentSessionId(newSessions[0].id);
-          setMessages(newSessions[0].messages);
-        } else {
-          const initialSession = { id: Date.now(), title: "New Session", messages: [defaultMessage], createdAt: Date.now() };
-          setSessions([initialSession]);
-          setCurrentSessionId(initialSession.id);
-          setMessages([defaultMessage]);
-        }
-      }
-    };
-
-    const handleFileSelect = (e) => {
-      const selected = Array.from(e.target.files);
-      setFilesToUpload((prev) => [...prev, ...selected]);
-      e.target.value = "";
-    };
-
-    const removeFile = (index) => {
-      setFilesToUpload(prev => prev.filter((_, i) => i !== index));
-    };
-
-    const handleUpload = async () => {
-      if (filesToUpload.length === 0) return;
-      setUploadStatus("🚀 UPLOADING...");
-
-      const formData = new FormData();
-      filesToUpload.forEach((file) => formData.append("files", file));
-
-      try {
-        const response = await axios.post(`${API_BASE}/upload`, formData, {
-          headers: { "Content-Type": "multipart/form-data" },
-        });
-
-        const { processed } = response.data;
-        setUploadStatus(`✨ SYNC COMPLETE`);
-
-        // 關鍵修改：上傳成功後，立刻重新抓取檔案列表
-        fetchFileList();
-
-        setMessages(prev => [...prev, {
-          role: "AI",
-          content: `🎉 **DATA INJECTED**\n\n成功載入 **${processed ? processed.length : 0}** 份文件核心。`
-        }]);
-
-        setFilesToUpload([]);
-        setTimeout(() => setUploadStatus(""), 3000);
-
-      } catch (error) {
-        console.error(error);
-        setUploadStatus("");
-        setErrorModal({ show: true, message: "Upload Gateway Error" });
-      }
-    };
-
-    const handleReset = async () => {
-      if (!window.confirm("確定要清空所有對話紀錄與知識庫嗎？此動作無法復原。")) return; // 建議加上防呆確認
-
-      // A. 切斷網路連線
-      if (abortControllerRef.current) {
-        abortControllerRef.current.abort();
-        abortControllerRef.current = null;
-      }
-      // B. 殺死打字機迴圈
-      if (typingIntervalRef.current) {
-        clearInterval(typingIntervalRef.current);
-        typingIntervalRef.current = null;
-      }
-      // C. 清除讀取狀態
-      setLoadingSessionId(null);
-
-      try {
-        // 呼叫後端重置 API
-        await axios.post(`${API_BASE}/reset`); // 建議改用 API_BASE 變數，比較乾淨
-        // 如果你的環境沒有 API_BASE，就維持 "http://127.0.0.1:8000/api/reset"
-
-        const resetMsg = { role: "AI", content: "🧹 **SYSTEM PURGED**\n記憶體與資料庫已強制格式化。" };
-
-        // 1. 重置對話
-        setMessages([resetMsg]);
-        setSessions([{ id: Date.now(), title: "New Session", messages: [resetMsg], createdAt: Date.now() }]);
-        localStorage.removeItem("chatSessions");
-
-        // 2. 重置上傳區塊
-        setUploadStatus("");
-        setFilesToUpload([]);
-
-        // 3. 【關鍵修改】同步清空左側檔案列表
-        setFileList([]);
-        // 這樣使用者就不會看到「幽靈檔案」，也不會誤點導致 404 錯誤
-
-      } catch (error) {
-        console.error(error);
-        setErrorModal({ show: true, message: "Reset Protocol Failed" });
-      }
-    };
-
-    const handleStop = () => {
-      if (abortControllerRef.current) {
-        abortControllerRef.current.abort();
-        abortControllerRef.current = null;
-      }
-      setLoadingSessionId(null);
-      setMessages((prev) => {
-        const newMessages = [...prev];
-        const lastIndex = newMessages.length - 1;
-        if (lastIndex >= 0) {
-          newMessages[lastIndex] = {
-            ...newMessages[lastIndex],
-            isTyping: false
-          };
-        }
-        return newMessages;
-      });
-    };
-
-    // 新增：處理圖片轉 Base64
-    const processImageFile = (file) => {
-      return new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.readAsDataURL(file);
-        reader.onload = () => {
-          const result = reader.result.toString();
-          // 移除 data URL header 取得純 base64 字串
-          const base64 = result.split(',')[1];
-          resolve({
-            id: Date.now() + Math.random(),
-            url: result,    // 用於前端預覽
-            base64: base64, // 用於後端發送
-            name: file.name
-          });
-        };
-        reader.onerror = error => reject(error);
-      });
-    };
-
-    const handleChatImageSelect = async (e) => {
-      const files = Array.from(e.target.files);
-      if (files.length === 0) return;
-      const processedImages = await Promise.all(files.map(processImageFile));
-      setChatImages(prev => [...prev, ...processedImages]);
-      e.target.value = "";
-    };
-
-    const removeChatImage = (index) => {
-      setChatImages(prev => prev.filter((_, i) => i !== index));
-    };
-
-    const handleSendMessage = async (e) => {
-      // 1. 按鍵判斷
-      if (e && e.key === "Enter" && !e.shiftKey) {
-        e.preventDefault();
-      } else if (e && (e.key !== "Enter" || e.shiftKey)) {
-        return;
-      }
-
-      // 檢查是否有輸入
-      if (!input.trim() && chatImages.length === 0) return;
-
-      const targetSessionId = currentSessionId;
-      const userMsgContent = input;
-
-      // 2. 準備訊息物件
-      const userMessage = {
-        role: "User",
-        content: userMsgContent,
-        images: chatImages.map(img => img.url)
-      };
-      const aiPlaceholder = { role: "AI", content: "", sources: [], isTyping: true };
-
-      // 3. 更新畫面 (Session 資料庫 & 前景)
-      setSessions(prev => prev.map(session => {
-        if (session.id === targetSessionId) {
-          return { ...session, messages: [...session.messages, userMessage, aiPlaceholder] };
-        }
-        return session;
-      }));
-
-      if (currentSessionIdRef.current === targetSessionId) {
-        setMessages(prev => [...prev, userMessage, aiPlaceholder]);
-      }
-
-      // 4. 準備發送 payload
-      const imagesPayload = chatImages.map(img => img.base64);
+    if (targetSession) {
+      // 3. 切換 ID
+      setCurrentSessionId(sessionId);
+      // 4. 載入目標 Session 的訊息到畫面上
+      setMessages(targetSession.messages);
+      // 5. 清空圖片暫存 (因為換房間了)
       setChatImages([]);
-      setInput("");
-      setLoadingSessionId(targetSessionId); // 開始轉圈圈
+    }
+  };
 
-      const controller = new AbortController();
-      abortControllerRef.current = controller;
+  const deleteSession = (e, sessionId) => {
+    e.stopPropagation();
+    const newSessions = sessions.filter(s => s.id !== sessionId);
+    setSessions(newSessions);
+    localStorage.setItem("chatSessions", JSON.stringify(newSessions));
+    if (sessionId === currentSessionId) {
+      if (newSessions.length > 0) {
+        setCurrentSessionId(newSessions[0].id);
+        setMessages(newSessions[0].messages);
+      } else {
+        const initialSession = { id: Date.now(), title: "New Session", messages: [defaultMessage], createdAt: Date.now() };
+        setSessions([initialSession]);
+        setCurrentSessionId(initialSession.id);
+        setMessages([defaultMessage]);
+      }
+    }
+  };
 
-      try {
-        // 修改這裡：增加 keepalive 屬性 (雖然對 POST 幫助有限，但可嘗試)
-        // 重點其實是後端處理時間。
-        const response = await fetch(`${API_BASE}/chat`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            query: userMsgContent,
-            model_name: selectedModel,
-            history: messages,
-            images: imagesPayload
-          }),
-          signal: controller.signal,
+  const handleFileSelect = (e) => {
+    const selected = Array.from(e.target.files);
+    setFilesToUpload((prev) => [...prev, ...selected]);
+    e.target.value = "";
+  };
+
+  const removeFile = (index) => {
+    setFilesToUpload(prev => prev.filter((_, i) => i !== index));
+  };
+
+  const handleUpload = async () => {
+    if (filesToUpload.length === 0) return;
+    setUploadStatus("🚀 UPLOADING...");
+
+    const formData = new FormData();
+    filesToUpload.forEach((file) => formData.append("files", file));
+
+    try {
+      const response = await axios.post(`${API_BASE}/upload`, formData, {
+        headers: { "Content-Type": "multipart/form-data" },
+      });
+
+      const { processed } = response.data;
+      setUploadStatus(`✨ SYNC COMPLETE`);
+
+      // 關鍵修改：上傳成功後，立刻重新抓取檔案列表
+      fetchFileList();
+
+      setMessages(prev => [...prev, {
+        role: "AI",
+        content: `🎉 **DATA INJECTED**\n\n成功載入 **${processed ? processed.length : 0}** 份文件核心。`
+      }]);
+
+      setFilesToUpload([]);
+      setTimeout(() => setUploadStatus(""), 3000);
+
+    } catch (error) {
+      console.error(error);
+      setUploadStatus("");
+      setErrorModal({ show: true, message: "Upload Gateway Error" });
+    }
+  };
+
+  const handleReset = async () => {
+    if (!window.confirm("確定要清空所有對話紀錄與知識庫嗎？此動作無法復原。")) return; // 建議加上防呆確認
+
+    // A. 切斷網路連線
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+    // B. 殺死打字機迴圈
+    if (typingIntervalRef.current) {
+      clearInterval(typingIntervalRef.current);
+      typingIntervalRef.current = null;
+    }
+    // C. 清除讀取狀態
+    setLoadingSessionId(null);
+
+    try {
+      // 呼叫後端重置 API
+      await axios.post(`${API_BASE}/reset`); // 建議改用 API_BASE 變數，比較乾淨
+      // 如果你的環境沒有 API_BASE，就維持 "http://127.0.0.1:8000/api/reset"
+
+      const resetMsg = { role: "AI", content: "🧹 **SYSTEM PURGED**\n記憶體與資料庫已強制格式化。" };
+
+      // 1. 重置對話
+      setMessages([resetMsg]);
+      setSessions([{ id: Date.now(), title: "New Session", messages: [resetMsg], createdAt: Date.now() }]);
+      localStorage.removeItem("chatSessions");
+
+      // 2. 重置上傳區塊
+      setUploadStatus("");
+      setFilesToUpload([]);
+
+      // 3. 【關鍵修改】同步清空左側檔案列表
+      setFileList([]);
+      // 這樣使用者就不會看到「幽靈檔案」，也不會誤點導致 404 錯誤
+
+    } catch (error) {
+      console.error(error);
+      setErrorModal({ show: true, message: "Reset Protocol Failed" });
+    }
+  };
+
+  const handleStop = () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+    setLoadingSessionId(null);
+    setMessages((prev) => {
+      const newMessages = [...prev];
+      const lastIndex = newMessages.length - 1;
+      if (lastIndex >= 0) {
+        newMessages[lastIndex] = {
+          ...newMessages[lastIndex],
+          isTyping: false
+        };
+      }
+      return newMessages;
+    });
+  };
+
+  // 新增：處理圖片轉 Base64
+  const processImageFile = (file) => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.readAsDataURL(file);
+      reader.onload = () => {
+        const result = reader.result.toString();
+        // 移除 data URL header 取得純 base64 字串
+        const base64 = result.split(',')[1];
+        resolve({
+          id: Date.now() + Math.random(),
+          url: result,    // 用於前端預覽
+          base64: base64, // 用於後端發送
+          name: file.name
         });
+      };
+      reader.onerror = error => reject(error);
+    });
+  };
 
-        if (!response.ok) {
-          // 增加更詳細的錯誤訊息處理
-          const errorText = await response.text();
-          throw new Error(`Network error: ${response.status} - ${errorText}`);
-        }
+  const handleChatImageSelect = async (e) => {
+    const files = Array.from(e.target.files);
+    if (files.length === 0) return;
+    const processedImages = await Promise.all(files.map(processImageFile));
+    setChatImages(prev => [...prev, ...processedImages]);
+    e.target.value = "";
+  };
 
-        const sourcesHeader = response.headers.get("X-Sources");
-        const sources = sourcesHeader ? JSON.parse(sourcesHeader) : [];
+  const removeChatImage = (index) => {
+    setChatImages(prev => prev.filter((_, i) => i !== index));
+  };
 
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
+  const handleSendMessage = async (e) => {
+    // 1. 按鍵判斷
+    if (e && e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+    } else if (e && (e.key !== "Enter" || e.shiftKey)) {
+      return;
+    }
 
-        // 變數準備：生產者與消費者共享的變數
-        let fullRawText = "";   // 【倉庫】後端傳來的所有文字
-        let displayedText = ""; // 【貨架】目前顯示在螢幕上的文字
-        let isStreamDone = false; // 標記：網路傳輸是否結束
+    // 檢查是否有輸入
+    if (!input.trim() && chatImages.length === 0) return;
+
+    const targetSessionId = currentSessionId;
+    const userMsgContent = input;
+
+    // 2. 準備訊息物件
+    const userMessage = {
+      role: "User",
+      content: userMsgContent,
+      images: chatImages.map(img => img.url)
+    };
+    const aiPlaceholder = { role: "AI", content: "", sources: [], isTyping: true };
+
+    // 3. 更新畫面 (Session 資料庫 & 前景)
+    setSessions(prev => prev.map(session => {
+      if (session.id === targetSessionId) {
+        return { ...session, messages: [...session.messages, userMessage, aiPlaceholder] };
+      }
+      return session;
+    }));
+
+    if (currentSessionIdRef.current === targetSessionId) {
+      setMessages(prev => [...prev, userMessage, aiPlaceholder]);
+    }
+
+    // 4. 準備發送 payload
+    const imagesPayload = chatImages.map(img => img.base64);
+    setChatImages([]);
+    setInput("");
+    setLoadingSessionId(targetSessionId); // 開始轉圈圈
+
+    const cleanHistory = messages.map(msg => {
+      // 解構賦值，把 images 抽出來，其餘的屬性放進 rest
+      const { images, ...rest } = msg;
+      return rest;
+    });
+
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
+    try {
+      const response = await fetch(`${API_BASE}/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          query: userMsgContent,
+          model_name: selectedModel,
+          history: cleanHistory, // <--- 使用清理過的純文字歷史紀錄
+          images: imagesPayload  // <--- 只傳送當次的新圖片
+        }),
+        signal: controller.signal,
+      });
+
+      if (!response.ok) {
+        // 增加更詳細的錯誤訊息處理
+        const errorText = await response.text();
+        throw new Error(`Network error: ${response.status} - ${errorText}`);
+      }
+
+      const sourcesHeader = response.headers.get("X-Sources");
+      const sources = sourcesHeader ? JSON.parse(sourcesHeader) : [];
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+
+      // 變數準備：生產者與消費者共享的變數
+      let fullRawText = "";   // 【倉庫】後端傳來的所有文字
+      let displayedText = ""; // 【貨架】目前顯示在螢幕上的文字
+      let isStreamDone = false; // 標記：網路傳輸是否結束
 
 
-        // 消費者：打字機特效迴圈 (每 30ms 執行一次)
-        typingIntervalRef.current = setInterval(() => {
-          // 算出還有多少字沒顯示
-          const remainingChars = fullRawText.length - displayedText.length;
+      // 消費者：打字機特效迴圈 (每 30ms 執行一次)
+      typingIntervalRef.current = setInterval(() => {
+        // 算出還有多少字沒顯示
+        const remainingChars = fullRawText.length - displayedText.length;
 
-          if (remainingChars > 0) {
-            // 動態加速邏輯：
-            // 如果剩餘字數很多 (>100)，每次就多吐一點 (例如剩 500 字，除以 20，一次吐 25 字)
-            // 如果剩餘字數很少，就維持最少 2 個字，保持打字感
-            // 這樣既能快速顯示長文，又能保留結尾的打字特效
-            const dynamicChunk = Math.max(2, Math.floor(remainingChars / 20));
+        if (remainingChars > 0) {
+          // 動態加速邏輯：
+          // 如果剩餘字數很多 (>100)，每次就多吐一點 (例如剩 500 字，除以 20，一次吐 25 字)
+          // 如果剩餘字數很少，就維持最少 2 個字，保持打字感
+          // 這樣既能快速顯示長文，又能保留結尾的打字特效
+          const dynamicChunk = Math.max(2, Math.floor(remainingChars / 20));
 
-            const nextChunk = fullRawText.slice(displayedText.length, displayedText.length + dynamicChunk);
-            displayedText += nextChunk;
+          const nextChunk = fullRawText.slice(displayedText.length, displayedText.length + dynamicChunk);
+          displayedText += nextChunk;
 
-            // 更新 Session 資料庫 (背景)
-            setSessions(prevSessions => prevSessions.map(session => {
-              if (session.id === targetSessionId) {
-                const newMsgs = [...session.messages];
-                const lastIdx = newMsgs.length - 1;
-                if (lastIdx >= 0 && newMsgs[lastIdx].role === "AI") {
-                  newMsgs[lastIdx] = {
-                    ...newMsgs[lastIdx],
-                    content: displayedText,
-                    sources: sources,
-                    isTyping: true
-                  };
-                }
-                return { ...session, messages: newMsgs };
-              }
-              return session;
-            }));
-
-            // 更新目前畫面 (前景)
-            if (currentSessionIdRef.current === targetSessionId) {
-              setMessages(prev => {
-                const newMessages = [...prev];
-                const lastIndex = newMessages.length - 1;
-                if (lastIndex >= 0 && newMessages[lastIndex].role === "AI") {
-                  newMessages[lastIndex] = {
-                    ...newMessages[lastIndex],
-                    content: displayedText,
-                    sources: sources,
-                    isTyping: true
-                  };
-                }
-                return newMessages;
-              });
-            }
-          }
-          // 停止條件
-          else if (isStreamDone) {
-            clearInterval(typingIntervalRef.current);
-            setLoadingSessionId(null);
-
-            const cleanFinalText = (rawText) => {
-              if (!rawText) return "";
-
-              // 1. 將所有文字依換行符號強制切成一行一行 (免疫所有換行陷阱)
-              const lines = rawText.split(/\r?\n/);
-
-              // 2. 制定嚴格的「黑名單特徵」進行過濾
-              const filteredLines = lines.filter(line => {
-                // 只要這行同時包含「特定符號」與「特定動作」，無論中間隔什麼字，整行拔除！
-                if (line.includes('🧠') && line.includes('分析')) return false;
-                if (line.includes('⚡') && line.includes('生成')) return false;
-                if (line.includes('🔗') && line.includes('調閱')) return false;
-                if (line.includes('🤔') && line.includes('聯想')) return false;
-                if (line.includes('✨') && line.includes('關鍵字')) return false;
-                if (line.includes('🚀') && line.includes('檢索')) return false;
-                if (line.includes('📄') && line.includes('觸發')) return false;
-                if (line.includes('========')) return false;
-
-                return true; // 沒有中槍的行，就乖乖保留
-              });
-
-              // 3. 重新組合文字，並把拔除後留下的連續空白行壓扁
-              return filteredLines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
-            };
-
-            const finalizeMessage = (msgs) => {
-              const newMsgs = [...msgs];
+          // 更新 Session 資料庫 (背景)
+          setSessions(prevSessions => prevSessions.map(session => {
+            if (session.id === targetSessionId) {
+              const newMsgs = [...session.messages];
               const lastIdx = newMsgs.length - 1;
-              if (lastIdx >= 0) {
+              if (lastIdx >= 0 && newMsgs[lastIdx].role === "AI") {
                 newMsgs[lastIdx] = {
                   ...newMsgs[lastIdx],
-                  // 關鍵點：在這裡把文字洗乾淨後，再存入最終對話框！
-                  content: cleanFinalText(newMsgs[lastIdx].content),
-                  isTyping: false
+                  content: displayedText,
+                  sources: sources,
+                  isTyping: true
                 };
               }
-              return newMsgs;
-            };
-
-            setSessions(prev => prev.map(s => s.id === targetSessionId ? { ...s, messages: finalizeMessage(s.messages) } : s));
-            if (currentSessionIdRef.current === targetSessionId) {
-              setMessages(prev => finalizeMessage(prev));
+              return { ...session, messages: newMsgs };
             }
-          }
-        }, 50);
+            return session;
+          }));
 
-        //  生產者：網路接收迴圈 (負責填滿倉庫)
-        while (true) {
-          const { value, done } = await reader.read();
-          if (done) {
-            isStreamDone = true; // 告訴打字機：貨補完了，印完就可以下班了
-            break;
+          // 更新目前畫面 (前景)
+          if (currentSessionIdRef.current === targetSessionId) {
+            setMessages(prev => {
+              const newMessages = [...prev];
+              const lastIndex = newMessages.length - 1;
+              if (lastIndex >= 0 && newMessages[lastIndex].role === "AI") {
+                newMessages[lastIndex] = {
+                  ...newMessages[lastIndex],
+                  content: displayedText,
+                  sources: sources,
+                  isTyping: true
+                };
+              }
+              return newMessages;
+            });
           }
-          // 只負責解碼並塞入 fullRawText，不負責更新 UI
-          fullRawText += decoder.decode(value, { stream: true });
         }
+        // 停止條件
+        else if (isStreamDone) {
+          clearInterval(typingIntervalRef.current);
+          setLoadingSessionId(null);
 
-      } catch (error) {
-        if (error.name !== 'AbortError') {
-          console.error("❌ 串流錯誤:", error);
-          setErrorModal({ show: true, message: "Stream Connection Failed" });
+          const cleanFinalText = (rawText) => {
+            if (!rawText) return "";
+
+            // 1. 將所有文字依換行符號強制切成一行一行 (免疫所有換行陷阱)
+            const lines = rawText.split(/\r?\n/);
+
+            // 2. 制定嚴格的「黑名單特徵」進行過濾
+            const filteredLines = lines.filter(line => {
+              // 只要這行同時包含「特定符號」與「特定動作」，無論中間隔什麼字，整行拔除！
+              if (line.includes('🧠') && line.includes('分析')) return false;
+              if (line.includes('⚡') && line.includes('生成')) return false;
+              if (line.includes('🔗') && line.includes('調閱')) return false;
+              if (line.includes('🤔') && line.includes('聯想')) return false;
+              if (line.includes('✨') && line.includes('關鍵字')) return false;
+              if (line.includes('🚀') && line.includes('檢索')) return false;
+              if (line.includes('📄') && line.includes('觸發')) return false;
+              if (line.includes('========')) return false;
+
+              return true; // 沒有中槍的行，就乖乖保留
+            });
+
+            // 3. 重新組合文字，並把拔除後留下的連續空白行壓扁
+            return filteredLines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+          };
+
+          const finalizeMessage = (msgs) => {
+            const newMsgs = [...msgs];
+            const lastIdx = newMsgs.length - 1;
+            if (lastIdx >= 0) {
+              newMsgs[lastIdx] = {
+                ...newMsgs[lastIdx],
+                // 關鍵點：在這裡把文字洗乾淨後，再存入最終對話框！
+                content: cleanFinalText(newMsgs[lastIdx].content),
+                isTyping: false
+              };
+            }
+            return newMsgs;
+          };
+
+          setSessions(prev => prev.map(s => s.id === targetSessionId ? { ...s, messages: finalizeMessage(s.messages) } : s));
+          if (currentSessionIdRef.current === targetSessionId) {
+            setMessages(prev => finalizeMessage(prev));
+          }
         }
-        setLoadingSessionId(null);
-      } finally {
-        abortControllerRef.current = null;
+      }, 50);
+
+      //  生產者：網路接收迴圈 (負責填滿倉庫)
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) {
+          isStreamDone = true; // 告訴打字機：貨補完了，印完就可以下班了
+          break;
+        }
+        // 只負責解碼並塞入 fullRawText，不負責更新 UI
+        fullRawText += decoder.decode(value, { stream: true });
       }
-    };
 
-    return (
-      <div className="flex items-center justify-center h-screen w-screen bg-[#0f0c29] font-sans overflow-hidden relative selection:bg-fuchsia-500 selection:text-white text-slate-800">
-        <CyberpunkNeonBackground />
-        <div className="relative z-10 w-[90vw] h-[90vh] max-w-[1400px] flex rounded-[40px] overflow-hidden shadow-[0_0_50px_rgba(217,70,239,0.2)] border border-white/20 bg-white/10 backdrop-blur-2xl">
-          <div className="w-80 min-w-[300px] bg-slate-900/60 backdrop-blur-xl flex flex-col p-6 text-white relative border-r border-white/10">
-            <div className="mb-8 flex items-center justify-between">
-              <div className="flex items-center gap-3">
-                <div className="w-10 h-10 rounded-2xl bg-gradient-to-br from-fuchsia-600 via-purple-600 to-cyan-600 flex items-center justify-center shadow-[0_0_20px_rgba(217,70,239,0.5)]">
-                  <Sparkles size={20} className="text-white" />
-                </div>
-                <div>
-                  <h1 className="text-lg font-bold tracking-tight text-transparent bg-clip-text bg-gradient-to-r from-fuchsia-400 to-cyan-400">Chroma AI</h1>
-                  <p className="text-[10px] text-slate-400 font-medium tracking-wider">PRO VERSION</p>
-                </div>
-              </div>
-              <motion.button
-                whileHover={{ scale: 1.1, rotate: 90 }}
-                whileTap={{ scale: 0.9 }}
-                onClick={createNewChat}
-                className="p-2 rounded-full bg-slate-800 border border-white/10 hover:border-cyan-400 text-cyan-400 hover:text-white transition-colors"
-                title="New Connection"
-              >
-                <Plus size={18} />
-              </motion.button>
-            </div>
-            <div className="flex-1 overflow-y-auto custom-scrollbar pr-2 space-y-8">
-              <div className="space-y-3">
-                <label className="text-[10px] font-bold text-cyan-400 uppercase tracking-widest pl-1">Model Engine</label>
-                <div className="relative group">
-                  <div className="absolute inset-0 bg-gradient-to-r from-fuchsia-600 to-cyan-600 rounded-2xl blur opacity-20 group-hover:opacity-50 transition-opacity" />
-                  <select
-                    value={selectedModel}
-                    onChange={(e) => setSelectedModel(e.target.value)}
-                    className="relative w-full bg-slate-800/80 text-white text-sm rounded-2xl px-4 py-3 border border-white/10 focus:outline-none focus:ring-1 focus:ring-cyan-400 appearance-none cursor-pointer font-medium hover:bg-slate-700 transition-colors"
-                  >
-                    {/* 修改這裡：用 map 把後端抓來的清單印出來 */}
-                    {availableModels.map((model) => (
-                      <option key={model} value={model}>
-                        {model} (遠端)
-                      </option>
-                    ))}
-                  </select>
-                  <div className="absolute right-4 top-3.5 text-cyan-400 pointer-events-none text-xs">▼</div>
-                </div>
-              </div>
-              <div className="space-y-3">
-                <label className="text-[10px] font-bold text-violet-400 uppercase tracking-widest pl-1 flex items-center gap-2">
-                  <Archive size={10} /> Mission Logs
-                </label>
-                <div className="space-y-2">
-                  {sessions.map((session) => (
-                    <motion.div
-                      key={session.id}
-                      onClick={() => switchSession(session.id)}
-                      className={`group relative flex items-center gap-3 p-3 rounded-xl cursor-pointer transition-all border ${currentSessionId === session.id
-                        ? "bg-slate-800/90 border-fuchsia-500/50 shadow-[0_0_15px_rgba(217,70,239,0.15)]"
-                        : "bg-slate-800/30 border-transparent hover:bg-slate-800/60 hover:border-white/10"
-                        }`}
-                    >
-                      {currentSessionId === session.id && (
-                        <div className="absolute left-0 w-1 h-6 bg-gradient-to-b from-fuchsia-500 to-cyan-500 rounded-r-full" />
-                      )}
-                      <MessageCircle size={14} className={currentSessionId === session.id ? "text-fuchsia-400" : "text-slate-500"} />
-                      <div className="flex-1 min-w-0">
-                        <p className={`text-xs font-medium truncate ${currentSessionId === session.id ? "text-white" : "text-slate-400 group-hover:text-slate-300"}`}>
-                          {session.title || "New Session"}
-                        </p>
-                        <p className="text-[10px] text-slate-200 truncate mt-0.5">
-                          {new Date(session.createdAt || Date.now()).toLocaleTimeString()}
-                        </p>
-                      </div>
-                      <button
-                        onClick={(e) => deleteSession(e, session.id)}
-                        className="opacity-0 group-hover:opacity-100 p-1.5 hover:bg-red-500/20 rounded-md text-slate-500 hover:text-red-400 transition-all"
-                      >
-                        <X size={12} />
-                      </button>
-                    </motion.div>
-                  ))}
-                </div>
-              </div>
-              <div className="space-y-3">
-                <label className="text-[10px] font-bold text-fuchsia-400 uppercase tracking-widest pl-1">Data Injection</label>
-                <motion.div
-                  whileHover={{ scale: 1.02, backgroundColor: "rgba(30, 41, 59, 0.8)" }}
-                  whileTap={{ scale: 0.98 }}
-                  onClick={() => fileInputRef.current.click()}
-                  className="relative overflow-hidden bg-slate-800/50 border border-fuchsia-500/30 border-dashed rounded-3xl p-6 text-center cursor-pointer group transition-colors pb-4 hover:border-fuchsia-400"
-                >
-                  <div className="w-12 h-12 bg-slate-700/50 rounded-full flex items-center justify-center mx-auto mb-3 group-hover:bg-fuchsia-500/20 group-hover:text-fuchsia-300 transition-all text-slate-400">
-                    <Upload size={20} />
-                  </div>
-                  <p className="text-sm font-semibold text-slate-300 group-hover:text-white transition-colors">Upload Files</p>
-                  <div className="flex justify-center gap-1.5 mt-3">
-                    <span className="text-[9px] bg-slate-900/80 px-2 py-0.5 rounded text-orange-300 border border-orange-500/20">PDF</span>
-                    <span className="text-[9px] bg-slate-900/80 px-2 py-0.5 rounded text-cyan-300 border border-blue-500/20">DOCX</span>
-                    <span className="text-[9px] bg-slate-900/80 px-2 py-0.5 rounded text-purple-300 border border-purple-500/20">JPG</span>
-                    <span className="text-[9px] bg-slate-900/80 px-2 py-0.5 rounded text-emerald-300 border border-emerald-500/20">XLSX</span>
-                  </div>
-                  <input
-                    ref={fileInputRef}
-                    type="file"
-                    className="hidden"
-                    onChange={handleFileSelect}
-                    multiple
-                    accept=".pdf,.docx,.txt,.xlsx,.csv,.jpg,.jpeg,.png,.webp"
-                  />
-                </motion.div>
-                <AnimatePresence>
-                  {filesToUpload.length > 0 && (
-                    <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: "auto" }} exit={{ opacity: 0, height: 0 }} className="space-y-3 overflow-hidden">
-                      <div className="flex flex-wrap gap-2 pt-1">
-                        {filesToUpload.map((file, idx) => (
-                          <div key={idx} className="flex items-center gap-2 bg-slate-800/80 px-3 py-1.5 rounded-full text-[10px] border border-white/10">
-                            <span className="truncate max-w-[80px] text-slate-300">{file.name}</span>
-                            <button onClick={() => removeFile(idx)} className="text-slate-500 hover:text-white"><X size={10} /></button>
-                          </div>
-                        ))}
-                      </div>
-                      <motion.button
-                        whileHover={{ scale: 1.02 }}
-                        whileTap={{ scale: 0.98 }}
-                        onClick={handleUpload}
-                        className="w-full py-3 rounded-2xl bg-gradient-to-r from-fuchsia-600 via-violet-600 to-cyan-600 text-white text-xs font-bold shadow-[0_0_20px_rgba(217,70,239,0.3)]"
-                      >
-                        INITIALIZE UPLOAD
-                      </motion.button>
-                    </motion.div>
-                  )}
-                </AnimatePresence>
-                {uploadStatus && (
-                  <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="text-center text-xs font-medium text-cyan-300 bg-cyan-900/30 py-2 rounded-xl border border-cyan-500/30">
-                    {uploadStatus}
-                  </motion.div>
-                )}
-                <div className="mt-4 pt-4 border-t border-white/10">
-                  <div className="flex items-center justify-between mb-2 px-1">
-                    <label className="text-[10px] font-bold text-emerald-400 uppercase tracking-widest flex items-center gap-2">
-                      <FileText size={10} /> Knowledge Base ({fileList.length})
-                    </label>
-                    <button onClick={fetchFileList} className="text-slate-500 hover:text-cyan-400 transition-colors" title="Refresh">
-                      <RefreshCw size={10} className={loadingFiles ? "animate-spin" : ""} />
-                    </button>
-                  </div>
+    } catch (error) {
+      if (error.name !== 'AbortError') {
+        console.error("❌ 串流錯誤:", error);
+        setErrorModal({ show: true, message: "Stream Connection Failed" });
+      }
+      setLoadingSessionId(null);
+    } finally {
+      abortControllerRef.current = null;
+    }
+  };
 
-                  <div className="flex-1 overflow-y-auto custom-scrollbar space-y-1 pr-1 max-h-[150px]">
-                    {fileList.length === 0 ? (
-                      <p className="text-center text-[10px] text-slate-600 py-4 italic">No data injected yet.</p>
-                    ) : (
-                      <AnimatePresence>
-                        {fileList.map((file) => (
-                          <motion.div
-                            key={file}
-                            initial={{ opacity: 0, x: -10 }}
-                            animate={{ opacity: 1, x: 0 }}
-                            exit={{ opacity: 0, height: 0 }}
-                            className="group flex items-center justify-between p-2 rounded-lg bg-slate-800/30 border border-transparent hover:border-emerald-500/30 hover:bg-slate-800/80 transition-all cursor-pointer"
-                            onClick={() => handleViewFile(file)}
-                          >
-                            <div className="flex items-center gap-2 min-w-0">
-                              <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 shadow-[0_0_5px_#10b981]" />
-                              <span className="text-[11px] text-slate-300 truncate font-mono max-w-[140px]" title={file}>
-                                {file}
-                              </span>
-                            </div>
-
-                            <button
-                              onClick={(e) => handleDeleteFile(e, file)}
-                              className="opacity-0 group-hover:opacity-100 p-1.5 rounded hover:bg-red-500/20 text-slate-500 hover:text-red-400 transition-all"
-                              title="Delete"
-                            >
-                              <Trash2 size={12} />
-                            </button>
-                          </motion.div>
-                        ))}
-                      </AnimatePresence>
-                    )}
-                  </div>
-                </div>
+  return (
+    <div className="flex items-center justify-center h-screen w-screen bg-[#0f0c29] font-sans overflow-hidden relative selection:bg-fuchsia-500 selection:text-white text-slate-800">
+      <CyberpunkNeonBackground />
+      <div className="relative z-10 w-[90vw] h-[90vh] max-w-[1400px] flex rounded-[40px] overflow-hidden shadow-[0_0_50px_rgba(217,70,239,0.2)] border border-white/20 bg-white/10 backdrop-blur-2xl">
+        <div className="w-80 min-w-[300px] bg-slate-900/60 backdrop-blur-xl flex flex-col p-6 text-white relative border-r border-white/10">
+          <div className="mb-8 flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-2xl bg-gradient-to-br from-fuchsia-600 via-purple-600 to-cyan-600 flex items-center justify-center shadow-[0_0_20px_rgba(217,70,239,0.5)]">
+                <Sparkles size={20} className="text-white" />
+              </div>
+              <div>
+                <h1 className="text-lg font-bold tracking-tight text-transparent bg-clip-text bg-gradient-to-r from-fuchsia-400 to-cyan-400">Chroma AI</h1>
+                <p className="text-[10px] text-slate-400 font-medium tracking-wider">PRO VERSION</p>
               </div>
             </div>
-            <div className="pt-4 mt-auto">
-              <button
-                onClick={handleReset}
-                className="w-full py-3 flex items-center justify-center gap-2 text-red-400 border border-red-500/30 hover:bg-red-500/10 hover:text-red-300 hover:border-red-400 rounded-2xl transition-all text-xs font-bold shadow-[0_0_10px_rgba(239,68,68,0.1)] hover:shadow-[0_0_20px_rgba(239,68,68,0.2)]"
-              >
-                <Trash2 size={14} /> PURGE SYSTEM
-              </button>
-            </div>
+            <motion.button
+              whileHover={{ scale: 1.1, rotate: 90 }}
+              whileTap={{ scale: 0.9 }}
+              onClick={createNewChat}
+              className="p-2 rounded-full bg-slate-800 border border-white/10 hover:border-cyan-400 text-cyan-400 hover:text-white transition-colors"
+              title="New Connection"
+            >
+              <Plus size={18} />
+            </motion.button>
           </div>
-          <div className="flex-1 flex flex-col relative bg-white/60 backdrop-blur-3xl border-l border-white/50">
-            <div className="h-16 border-b border-white/50 flex items-center px-8 bg-white/40 backdrop-blur-md justify-between z-20">
-              <div className="flex items-center gap-2">
-                <div className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse shadow-[0_0_10px_#34d399]" />
-                <span className="text-sm font-bold text-slate-600">SUCCESS RUN</span>
-                <span className="text-xs text-slate-400 ml-2 px-2 py-0.5 bg-white/50 rounded-full border border-white/20">
-                  ID: {currentSessionId ? currentSessionId.toString().slice(-6) : "Unknown"}
-                </span>
-              </div>
-              <div className="flex gap-2">
-                <div className="w-3 h-3 rounded-full bg-red-400/50" />
-                <div className="w-3 h-3 rounded-full bg-yellow-400/50" />
-                <div className="w-3 h-3 rounded-full bg-green-400/50" />
+          <div className="flex-1 overflow-y-auto custom-scrollbar pr-2 space-y-8">
+            <div className="space-y-3">
+              <label className="text-[10px] font-bold text-cyan-400 uppercase tracking-widest pl-1">Model Engine</label>
+              <div className="relative group">
+                <div className="absolute inset-0 bg-gradient-to-r from-fuchsia-600 to-cyan-600 rounded-2xl blur opacity-20 group-hover:opacity-50 transition-opacity" />
+                <select
+                  value={selectedModel}
+                  onChange={(e) => setSelectedModel(e.target.value)}
+                  className="relative w-full bg-slate-800/80 text-white text-sm rounded-2xl px-4 py-3 border border-white/10 focus:outline-none focus:ring-1 focus:ring-cyan-400 appearance-none cursor-pointer font-medium hover:bg-slate-700 transition-colors"
+                >
+                  {/* 修改這裡：用 map 把後端抓來的清單印出來 */}
+                  {availableModels.map((model) => (
+                    <option key={model} value={model}>
+                      {model} (遠端)
+                    </option>
+                  ))}
+                </select>
+                <div className="absolute right-4 top-3.5 text-cyan-400 pointer-events-none text-xs">▼</div>
               </div>
             </div>
-            <div className="flex-1 overflow-y-auto p-8 space-y-8 scroll-smooth relative z-10">
-              {messages.map((msg, index) => {
-                //  關鍵修改：如果是 AI 且正在打字，直接 return null (隱藏)，交給底部的 ThinkingBubble 顯示
-                if (msg.role === "AI" && msg.isTyping) return null;
-
-                return (
+            <div className="space-y-3">
+              <label className="text-[10px] font-bold text-violet-400 uppercase tracking-widest pl-1 flex items-center gap-2">
+                <Archive size={10} /> Mission Logs
+              </label>
+              <div className="space-y-2">
+                {sessions.map((session) => (
                   <motion.div
-                    key={index}
-                    initial={{ opacity: 0, y: 15, scale: 0.98 }}
-                    animate={{ opacity: 1, y: 0, scale: 1 }}
-                    className={`flex ${msg.role === "User" ? "justify-end" : "justify-start"}`}
-                  >
-                    <div className={`flex gap-3 max-w-[85%] ${msg.role === "User" ? "flex-row-reverse" : "flex-row"}`}>
-                      <div className={`w-10 h-10 rounded-2xl flex-shrink-0 flex items-center justify-center shadow-md ${msg.role === "User"
-                        ? "bg-gradient-to-tr from-sky-400 to-cyan-400 text-white shadow-sky-500/40"
-                        : "bg-white text-cyan-600 shadow-slate-200/50"
-                        }`}>
-                        {msg.role === "User" ? <User size={18} /> : <Bot size={22} />}
-                      </div>
-                      <div className={`flex flex-col ${msg.role === "User" ? "items-end" : "items-start"} min-w-0`}>
-                        <div className={`p-5 rounded-3xl shadow-sm backdrop-blur-xl border relative overflow-hidden ${msg.role === "User"
-                          ? "bg-gradient-to-br from-sky-500 to-blue-600 text-white rounded-br-none border-white/20 shadow-[0_5px_15px_rgba(14,165,233,0.3)]"
-                          : "bg-white/80 text-slate-800 rounded-bl-none border-white/60 shadow-lg shadow-cyan-500/5"
-                          }`}>
-
-                          {/*  內容顯示區 */}
-                          {msg.content && (
-                            <div className={`prose max-w-none text-sm leading-relaxed ${msg.role === "User" ? "prose-invert text-white" : "prose-slate"}`}>
-                              <MarkdownRenderer content={msg.content} />
-                            </div>
-                          )}
-
-                          {msg.images && msg.images.length > 0 && (
-                            <div className="flex flex-wrap gap-2 mb-3">
-                              {msg.images.map((imgUrl, i) => (
-                                <img key={i} src={imgUrl} alt="uploaded" className="max-w-[200px] max-h-[200px] rounded-lg border border-white/20" />
-                              ))}
-                            </div>
-                          )}
-
-                          {!msg.isTyping && msg.sources && msg.sources.length > 0 && (
-                            <div className="mt-4 pt-3 border-t border-white/20 flex flex-wrap gap-2">
-                              {msg.sources.map((src, i) => (
-                                <span key={i} className="text-[10px] px-2 py-1 rounded-md bg-white/20 border border-white/10 text-white/90 flex items-center gap-1 font-bold">
-                                  <Paperclip size={10} /> {src}
-                                </span>
-                              ))}
-                            </div>
-                          )}
-                        </div>
-                      </div>
-                    </div>
-                  </motion.div>
-                );
-              })}
-
-              {loadingSessionId === currentSessionId && (
-                <ThinkingBubble
-                  content={messages.find(m => m.role === 'AI' && m.isTyping)?.content || ""}
-                />
-              )}
-
-              <div ref={chatEndRef} />
-            </div>
-            {/* 輸入框區域 */}
-            <div className="p-8 pt-2 z-20">
-              <div className="relative max-w-4xl mx-auto">
-                <div className="absolute -inset-1 bg-gradient-to-r from-fuchsia-500 via-violet-500 to-cyan-500 rounded-full opacity-30 blur-md group-focus-within:opacity-60 transition-opacity duration-500" />
-
-                {/* 新增：圖片預覽區 (放在輸入框容器上方) */}
-                <AnimatePresence>
-                  {chatImages.length > 0 && (
-                    <motion.div
-                      initial={{ opacity: 0, y: 10 }}
-                      animate={{ opacity: 1, y: 0 }}
-                      exit={{ opacity: 0, y: 10 }}
-                      className="absolute bottom-full mb-3 left-0 flex gap-2"
-                    >
-                      {chatImages.map((img, index) => (
-                        <div key={img.id} className="relative group">
-                          <img src={img.url} alt="preview" className="h-16 w-16 object-cover rounded-xl border-2 border-cyan-400 shadow-lg" />
-                          <button
-                            onClick={() => removeChatImage(index)}
-                            className="absolute -top-1 -right-1 bg-red-500 text-white rounded-full p-0.5 shadow-md hover:bg-red-600 transition-colors"
-                          >
-                            <X size={10} />
-                          </button>
-                        </div>
-                      ))}
-                    </motion.div>
-                  )}
-                </AnimatePresence>
-
-                <div className="relative flex items-center gap-3 bg-white/90 backdrop-blur-2xl rounded-3xl p-2 pl-4 shadow-[0_10px_30px_-5px_rgba(6,182,212,0.2)] border border-white">
-
-                  <textarea
-                    ref={textareaRef}
-                    value={input}
-                    onChange={(e) => setInput(e.target.value)}
-                    onKeyDown={handleSendMessage}
-                    placeholder="Enter command..."
-                    rows={1}
-                    className="flex-1 bg-transparent text-slate-700 text-base focus:outline-none placeholder-slate-400 font-medium resize-none py-3 max-h-[120px]"
-                    disabled={false}
-                  />
-                  <motion.button
-                    whileHover={{ scale: 1.05 }}
-                    whileTap={{ scale: 0.95 }}
-                    onClick={() => loadingSessionId === currentSessionId ? handleStop() : handleSendMessage()}
-                    // 修正：檢查 loadingSessionId 而不是 isLoading
-                    disabled={!input.trim() && chatImages.length === 0 && loadingSessionId !== currentSessionId}
-                    className={`p-3 rounded-full text-white shadow-lg transition-all self-end ${loadingSessionId === currentSessionId
-                      ? "bg-gradient-to-r from-red-500 to-orange-500 hover:shadow-red-500/30 cursor-pointer"
-                      : "bg-gradient-to-r from-fuchsia-600 to-cyan-600 hover:shadow-cyan-500/30 disabled:opacity-50 disabled:cursor-not-allowed"
+                    key={session.id}
+                    onClick={() => switchSession(session.id)}
+                    className={`group relative flex items-center gap-3 p-3 rounded-xl cursor-pointer transition-all border ${currentSessionId === session.id
+                      ? "bg-slate-800/90 border-fuchsia-500/50 shadow-[0_0_15px_rgba(217,70,239,0.15)]"
+                      : "bg-slate-800/30 border-transparent hover:bg-slate-800/60 hover:border-white/10"
                       }`}
                   >
-                    {/*  修正：檢查 loadingSessionId 而不是 isLoading */}
-                    {loadingSessionId === currentSessionId ? (
-                      <Square size={20} className="fill-current animate-pulse" />
-                    ) : (
-                      <Send size={20} />
+                    {currentSessionId === session.id && (
+                      <div className="absolute left-0 w-1 h-6 bg-gradient-to-b from-fuchsia-500 to-cyan-500 rounded-r-full" />
                     )}
-                  </motion.button>
-                </div>
+                    <MessageCircle size={14} className={currentSessionId === session.id ? "text-fuchsia-400" : "text-slate-500"} />
+                    <div className="flex-1 min-w-0">
+                      <p className={`text-xs font-medium truncate ${currentSessionId === session.id ? "text-white" : "text-slate-400 group-hover:text-slate-300"}`}>
+                        {session.title || "New Session"}
+                      </p>
+                      <p className="text-[10px] text-slate-200 truncate mt-0.5">
+                        {new Date(session.createdAt || Date.now()).toLocaleTimeString()}
+                      </p>
+                    </div>
+                    <button
+                      onClick={(e) => deleteSession(e, session.id)}
+                      className="opacity-0 group-hover:opacity-100 p-1.5 hover:bg-red-500/20 rounded-md text-slate-500 hover:text-red-400 transition-all"
+                    >
+                      <X size={12} />
+                    </button>
+                  </motion.div>
+                ))}
               </div>
-              <p className="text-center text-[10px] text-slate-400 mt-3 font-medium opacity-60">
-                SECURE CONNECTION ESTABLISHED • v9.0
-              </p>
             </div>
-          </div>
-        </div>
-        <AnimatePresence>
-          {viewingFile && (
-            <motion.div
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
-              className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4"
-              onClick={() => setViewingFile(null)}
-            >
+            <div className="space-y-3">
+              <label className="text-[10px] font-bold text-fuchsia-400 uppercase tracking-widest pl-1">Data Injection</label>
               <motion.div
-                initial={{ scale: 0.9, y: 20 }}
-                animate={{ scale: 1, y: 0 }}
-                exit={{ scale: 0.9, y: 20 }}
-                className="bg-slate-900 border border-cyan-500/50 w-full max-w-3xl max-h-[80vh] rounded-2xl shadow-[0_0_50px_rgba(6,182,212,0.2)] flex flex-col overflow-hidden"
-                onClick={e => e.stopPropagation()}
+                whileHover={{ scale: 1.02, backgroundColor: "rgba(30, 41, 59, 0.8)" }}
+                whileTap={{ scale: 0.98 }}
+                onClick={() => fileInputRef.current.click()}
+                className="relative overflow-hidden bg-slate-800/50 border border-fuchsia-500/30 border-dashed rounded-3xl p-6 text-center cursor-pointer group transition-colors pb-4 hover:border-fuchsia-400"
               >
-                {/* Header */}
-                <div className="flex items-center justify-between p-4 border-b border-white/10 bg-slate-800/50">
-                  <div className="flex items-center gap-2 text-cyan-400">
-                    <FileText size={20} />
-                    <h3 className="font-bold text-lg truncate max-w-md">{viewingFile}</h3>
-                  </div>
-                  <button
-                    onClick={() => setViewingFile(null)}
-                    className="p-2 hover:bg-white/10 rounded-full transition-colors text-slate-400 hover:text-white"
-                  >
-                    <X size={20} />
+                <div className="w-12 h-12 bg-slate-700/50 rounded-full flex items-center justify-center mx-auto mb-3 group-hover:bg-fuchsia-500/20 group-hover:text-fuchsia-300 transition-all text-slate-400">
+                  <Upload size={20} />
+                </div>
+                <p className="text-sm font-semibold text-slate-300 group-hover:text-white transition-colors">Upload Files</p>
+                <div className="flex justify-center gap-1.5 mt-3">
+                  <span className="text-[9px] bg-slate-900/80 px-2 py-0.5 rounded text-orange-300 border border-orange-500/20">PDF</span>
+                  <span className="text-[9px] bg-slate-900/80 px-2 py-0.5 rounded text-cyan-300 border border-blue-500/20">DOCX</span>
+                  <span className="text-[9px] bg-slate-900/80 px-2 py-0.5 rounded text-purple-300 border border-purple-500/20">JPG</span>
+                  <span className="text-[9px] bg-slate-900/80 px-2 py-0.5 rounded text-emerald-300 border border-emerald-500/20">XLSX</span>
+                </div>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  className="hidden"
+                  onChange={handleFileSelect}
+                  multiple
+                  accept=".pdf,.docx,.txt,.xlsx,.csv,.jpg,.jpeg,.png,.webp"
+                />
+              </motion.div>
+              <AnimatePresence>
+                {filesToUpload.length > 0 && (
+                  <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: "auto" }} exit={{ opacity: 0, height: 0 }} className="space-y-3 overflow-hidden">
+                    <div className="flex flex-wrap gap-2 pt-1">
+                      {filesToUpload.map((file, idx) => (
+                        <div key={idx} className="flex items-center gap-2 bg-slate-800/80 px-3 py-1.5 rounded-full text-[10px] border border-white/10">
+                          <span className="truncate max-w-[80px] text-slate-300">{file.name}</span>
+                          <button onClick={() => removeFile(idx)} className="text-slate-500 hover:text-white"><X size={10} /></button>
+                        </div>
+                      ))}
+                    </div>
+                    <motion.button
+                      whileHover={{ scale: 1.02 }}
+                      whileTap={{ scale: 0.98 }}
+                      onClick={handleUpload}
+                      className="w-full py-3 rounded-2xl bg-gradient-to-r from-fuchsia-600 via-violet-600 to-cyan-600 text-white text-xs font-bold shadow-[0_0_20px_rgba(217,70,239,0.3)]"
+                    >
+                      INITIALIZE UPLOAD
+                    </motion.button>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+              {uploadStatus && (
+                <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="text-center text-xs font-medium text-cyan-300 bg-cyan-900/30 py-2 rounded-xl border border-cyan-500/30">
+                  {uploadStatus}
+                </motion.div>
+              )}
+              <div className="mt-4 pt-4 border-t border-white/10">
+                <div className="flex items-center justify-between mb-2 px-1">
+                  <label className="text-[10px] font-bold text-emerald-400 uppercase tracking-widest flex items-center gap-2">
+                    <FileText size={10} /> Knowledge Base ({fileList.length})
+                  </label>
+                  <button onClick={fetchFileList} className="text-slate-500 hover:text-cyan-400 transition-colors" title="Refresh">
+                    <RefreshCw size={10} className={loadingFiles ? "animate-spin" : ""} />
                   </button>
                 </div>
 
-                {/* Content */}
-                <div className="flex-1 overflow-y-auto p-6 custom-scrollbar bg-[#0f0c29]">
-                  <pre className="whitespace-pre-wrap font-mono text-sm text-slate-300 leading-relaxed">
-                    {viewContent}
-                  </pre>
-                </div>
+                <div className="flex-1 overflow-y-auto custom-scrollbar space-y-1 pr-1 max-h-[150px]">
+                  {fileList.length === 0 ? (
+                    <p className="text-center text-[10px] text-slate-600 py-4 italic">No data injected yet.</p>
+                  ) : (
+                    <AnimatePresence>
+                      {fileList.map((file) => (
+                        <motion.div
+                          key={file}
+                          initial={{ opacity: 0, x: -10 }}
+                          animate={{ opacity: 1, x: 0 }}
+                          exit={{ opacity: 0, height: 0 }}
+                          className="group flex items-center justify-between p-2 rounded-lg bg-slate-800/30 border border-transparent hover:border-emerald-500/30 hover:bg-slate-800/80 transition-all cursor-pointer"
+                          onClick={() => handleViewFile(file)}
+                        >
+                          <div className="flex items-center gap-2 min-w-0">
+                            <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 shadow-[0_0_5px_#10b981]" />
+                            <span className="text-[11px] text-slate-300 truncate font-mono max-w-[140px]" title={file}>
+                              {file}
+                            </span>
+                          </div>
 
-                {/* Footer */}
-                <div className="p-3 border-t border-white/10 bg-slate-800/50 text-right text-xs text-slate-500">
-                  SOURCE CONTENT VIEWER v1.0
+                          <button
+                            onClick={(e) => handleDeleteFile(e, file)}
+                            className="opacity-0 group-hover:opacity-100 p-1.5 rounded hover:bg-red-500/20 text-slate-500 hover:text-red-400 transition-all"
+                            title="Delete"
+                          >
+                            <Trash2 size={12} />
+                          </button>
+                        </motion.div>
+                      ))}
+                    </AnimatePresence>
+                  )}
                 </div>
-              </motion.div>
-            </motion.div>
-          )}
-        </AnimatePresence>
+              </div>
+            </div>
+          </div>
+          <div className="pt-4 mt-auto">
+            <button
+              onClick={handleReset}
+              className="w-full py-3 flex items-center justify-center gap-2 text-red-400 border border-red-500/30 hover:bg-red-500/10 hover:text-red-300 hover:border-red-400 rounded-2xl transition-all text-xs font-bold shadow-[0_0_10px_rgba(239,68,68,0.1)] hover:shadow-[0_0_20px_rgba(239,68,68,0.2)]"
+            >
+              <Trash2 size={14} /> PURGE SYSTEM
+            </button>
+          </div>
+        </div>
+        <div className="flex-1 flex flex-col relative bg-white/60 backdrop-blur-3xl border-l border-white/50">
+          <div className="h-16 border-b border-white/50 flex items-center px-8 bg-white/40 backdrop-blur-md justify-between z-20">
+            <div className="flex items-center gap-2">
+              <div className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse shadow-[0_0_10px_#34d399]" />
+              <span className="text-sm font-bold text-slate-600">SUCCESS RUN</span>
+              <span className="text-xs text-slate-400 ml-2 px-2 py-0.5 bg-white/50 rounded-full border border-white/20">
+                ID: {currentSessionId ? currentSessionId.toString().slice(-6) : "Unknown"}
+              </span>
+            </div>
+            <div className="flex gap-2">
+              <div className="w-3 h-3 rounded-full bg-red-400/50" />
+              <div className="w-3 h-3 rounded-full bg-yellow-400/50" />
+              <div className="w-3 h-3 rounded-full bg-green-400/50" />
+            </div>
+          </div>
+          <div className="flex-1 overflow-y-auto p-8 space-y-8 scroll-smooth relative z-10">
+            {messages.map((msg, index) => {
+              //  關鍵修改：如果是 AI 且正在打字，直接 return null (隱藏)，交給底部的 ThinkingBubble 顯示
+              if (msg.role === "AI" && msg.isTyping) return null;
+
+              return (
+                <motion.div
+                  key={index}
+                  initial={{ opacity: 0, y: 15, scale: 0.98 }}
+                  animate={{ opacity: 1, y: 0, scale: 1 }}
+                  className={`flex ${msg.role === "User" ? "justify-end" : "justify-start"}`}
+                >
+                  <div className={`flex gap-3 max-w-[85%] ${msg.role === "User" ? "flex-row-reverse" : "flex-row"}`}>
+                    <div className={`w-10 h-10 rounded-2xl flex-shrink-0 flex items-center justify-center shadow-md ${msg.role === "User"
+                      ? "bg-gradient-to-tr from-sky-400 to-cyan-400 text-white shadow-sky-500/40"
+                      : "bg-white text-cyan-600 shadow-slate-200/50"
+                      }`}>
+                      {msg.role === "User" ? <User size={18} /> : <Bot size={22} />}
+                    </div>
+                    <div className={`flex flex-col ${msg.role === "User" ? "items-end" : "items-start"} min-w-0`}>
+                      <div className={`p-5 rounded-3xl shadow-sm backdrop-blur-xl border relative overflow-hidden ${msg.role === "User"
+                        ? "bg-gradient-to-br from-sky-500 to-blue-600 text-white rounded-br-none border-white/20 shadow-[0_5px_15px_rgba(14,165,233,0.3)]"
+                        : "bg-white/80 text-slate-800 rounded-bl-none border-white/60 shadow-lg shadow-cyan-500/5"
+                        }`}>
+
+                        {/*  內容顯示區 */}
+                        {msg.content && (
+                          <div className={`prose max-w-none text-sm leading-relaxed ${msg.role === "User" ? "prose-invert text-white" : "prose-slate"}`}>
+                            <MarkdownRenderer content={msg.content} />
+                          </div>
+                        )}
+
+                        {msg.images && msg.images.length > 0 && (
+                          <div className="flex flex-wrap gap-2 mb-3">
+                            {msg.images.map((imgUrl, i) => (
+                              <img key={i} src={imgUrl} alt="uploaded" className="max-w-[200px] max-h-[200px] rounded-lg border border-white/20" />
+                            ))}
+                          </div>
+                        )}
+
+                        {!msg.isTyping && msg.sources && msg.sources.length > 0 && (
+                          <div className="mt-4 pt-3 border-t border-white/20 flex flex-wrap gap-2">
+                            {msg.sources.map((src, i) => (
+                              <span key={i} className="text-[10px] px-2 py-1 rounded-md bg-white/20 border border-white/10 text-white/90 flex items-center gap-1 font-bold">
+                                <Paperclip size={10} /> {src}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                </motion.div>
+              );
+            })}
+
+            {loadingSessionId !== null && loadingSessionId === currentSessionId && (
+              <ThinkingBubble
+                content={messages.find(m => m.role === 'AI' && m.isTyping)?.content || ""}
+              />
+            )}
+
+            <div ref={chatEndRef} />
+          </div>
+          {/* 輸入框區域 */}
+          <div className="p-8 pt-2 z-20">
+            <div className="relative max-w-4xl mx-auto">
+              <div className="absolute -inset-1 bg-gradient-to-r from-fuchsia-500 via-violet-500 to-cyan-500 rounded-full opacity-30 blur-md group-focus-within:opacity-60 transition-opacity duration-500" />
+
+              {/* 新增：圖片預覽區 (放在輸入框容器上方) */}
+              <AnimatePresence>
+                {chatImages.length > 0 && (
+                  <motion.div
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: 10 }}
+                    className="absolute bottom-full mb-3 left-0 flex gap-2"
+                  >
+                    {chatImages.map((img, index) => (
+                      <div key={img.id} className="relative group">
+                        <img src={img.url} alt="preview" className="h-16 w-16 object-cover rounded-xl border-2 border-cyan-400 shadow-lg" />
+                        <button
+                          onClick={() => removeChatImage(index)}
+                          className="absolute -top-1 -right-1 bg-red-500 text-white rounded-full p-0.5 shadow-md hover:bg-red-600 transition-colors"
+                        >
+                          <X size={10} />
+                        </button>
+                      </div>
+                    ))}
+                  </motion.div>
+                )}
+              </AnimatePresence>
+
+              <div className="relative flex items-center gap-3 bg-white/90 backdrop-blur-2xl rounded-3xl p-2 pl-4 shadow-[0_10px_30px_-5px_rgba(6,182,212,0.2)] border border-white">
+                {/* 1. 隱藏的圖片選擇器 */}
+                <input
+                  type="file"
+                  ref={chatImageInputRef}
+                  className="hidden"
+                  onChange={handleChatImageSelect}
+                  multiple
+                  accept="image/jpeg,image/png,image/webp,image/gif"
+                />
+
+                {/* 2. 圖片上傳按鈕 (這顆就是你截圖裡不見的按鈕！) */}
+                <motion.button
+                  whileHover={{ scale: 1.1 }}
+                  whileTap={{ scale: 0.9 }}
+                  onClick={() => chatImageInputRef.current.click()}
+                  className="p-2 text-slate-400 hover:text-cyan-500 hover:bg-cyan-500/10 rounded-full transition-colors self-end mb-1"
+                  title="Upload Image"
+                >
+                  <ImageIcon size={22} />
+                </motion.button>
+                <textarea
+                  ref={textareaRef}
+                  value={input}
+                  onChange={(e) => setInput(e.target.value)}
+                  onKeyDown={handleSendMessage}
+                  placeholder="Enter command..."
+                  rows={1}
+                  className="flex-1 bg-transparent text-slate-700 text-base focus:outline-none placeholder-slate-400 font-medium resize-none py-3 max-h-[120px]"
+                  disabled={false}
+                />
+                <motion.button
+                  whileHover={{ scale: 1.05 }}
+                  whileTap={{ scale: 0.95 }}
+                  // 加上 loadingSessionId !== null 的檢查
+                  onClick={() => (loadingSessionId !== null && loadingSessionId === currentSessionId) ? handleStop() : handleSendMessage()}
+                  disabled={!input.trim() && chatImages.length === 0 && loadingSessionId !== null && loadingSessionId !== currentSessionId}
+                  className={`p-3 rounded-full text-white shadow-lg transition-all self-end ${(loadingSessionId !== null && loadingSessionId === currentSessionId)
+                    ? "bg-gradient-to-r from-red-500 to-orange-500 hover:shadow-red-500/30 cursor-pointer"
+                    : "bg-gradient-to-r from-fuchsia-600 to-cyan-600 hover:shadow-cyan-500/30 disabled:opacity-50 disabled:cursor-not-allowed"
+                    }`}
+                >
+                  {(loadingSessionId !== null && loadingSessionId === currentSessionId) ? (
+                    <Square size={20} className="fill-current animate-pulse" />
+                  ) : (
+                    <Send size={20} />
+                  )}
+                </motion.button>
+              </div>
+            </div>
+            <p className="text-center text-[10px] text-slate-400 mt-3 font-medium opacity-60">
+              SECURE CONNECTION ESTABLISHED • v9.0
+            </p>
+          </div>
+        </div>
       </div>
-    );
-  }
+      <AnimatePresence>
+        {viewingFile && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4"
+            onClick={() => setViewingFile(null)}
+          >
+            <motion.div
+              initial={{ scale: 0.9, y: 20 }}
+              animate={{ scale: 1, y: 0 }}
+              exit={{ scale: 0.9, y: 20 }}
+              className="bg-slate-900 border border-cyan-500/50 w-full max-w-3xl max-h-[80vh] rounded-2xl shadow-[0_0_50px_rgba(6,182,212,0.2)] flex flex-col overflow-hidden"
+              onClick={e => e.stopPropagation()}
+            >
+              {/* Header */}
+              <div className="flex items-center justify-between p-4 border-b border-white/10 bg-slate-800/50">
+                <div className="flex items-center gap-2 text-cyan-400">
+                  <FileText size={20} />
+                  <h3 className="font-bold text-lg truncate max-w-md">{viewingFile}</h3>
+                </div>
+                <button
+                  onClick={() => setViewingFile(null)}
+                  className="p-2 hover:bg-white/10 rounded-full transition-colors text-slate-400 hover:text-white"
+                >
+                  <X size={20} />
+                </button>
+              </div>
+
+              {/* Content */}
+              <div className="flex-1 overflow-y-auto p-6 custom-scrollbar bg-[#0f0c29]">
+                <pre className="whitespace-pre-wrap font-mono text-sm text-slate-300 leading-relaxed">
+                  {viewContent}
+                </pre>
+              </div>
+
+              {/* Footer */}
+              <div className="p-3 border-t border-white/10 bg-slate-800/50 text-right text-xs text-slate-500">
+                SOURCE CONTENT VIEWER v1.0
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
 }
 export default App;

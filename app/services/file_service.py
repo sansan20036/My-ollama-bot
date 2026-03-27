@@ -9,13 +9,13 @@ import io
 import fitz
 import numpy as np
 import cv2
-import pdfplumber  # 新增：用於精準提取 PDF 表格的套件
+import pdfplumber
 from rapidocr_onnxruntime import RapidOCR
 from PIL import Image
 from abc import ABC, abstractmethod
 from fastapi import UploadFile
 from langchain_community.document_loaders import Docx2txtLoader, TextLoader
-import re  #  新增：處理欄位名稱的正規表達式
+import re
 
 from app.core.config import settings
 from app.services.vector_store import VectorStoreService
@@ -24,59 +24,112 @@ from app.services.vector_store import VectorStoreService
 logger = logging.getLogger(__name__)
 
 
-# 新增：背景表格提煉引擎 (ETL Processor)
+# ==========================================
+# 背景表格提煉引擎 (ETL Processor)
+# ==========================================
 def extract_and_save_tables(pdf_path: str):
-    """在上傳階段，直接將 PDF 內的表格提煉並存成同名的 _tables.csv"""
+    """在上傳階段，直接將 PDF 內的表格提煉並存成同名的 _tables.csv (寬容模式 + ETL正規化)"""
     csv_path = pdf_path.rsplit('.', 1)[0] + "_tables.csv"
     all_data = []
 
     try:
-        logger.info(f"[背景任務] 正在掃描 {os.path.basename(pdf_path)} 是否包含表格...")
+        logger.info(f"[背景任務] 啟動 PDF 表格提煉引擎: {os.path.basename(pdf_path)}")
         with pdfplumber.open(pdf_path) as pdf:
             for page in pdf.pages:
-                # 第一道粗篩：連 4 條線都沒有的純文字，直接跳過
-                if len(page.lines) < 4 and len(page.rects) < 1:
-                    continue
-
-                # 第二道精篩：利用 find_tables() 尋找真實網格，排除裝飾線
-                if not page.find_tables():
-                    continue
-
-                # 確定有表格結構，才啟動文字萃取
                 tables = page.extract_tables()
                 for table in tables:
+                    clean_table = []
                     for row in table:
-                        # 將 None 換成空字串，並去除多餘換行
                         cleaned_row = [str(cell).replace('\n', ' ').strip() if cell else "" for cell in row]
                         if any(cleaned_row):
-                            all_data.append(cleaned_row)
+                            clean_table.append(cleaned_row)
+                    if len(clean_table) > 1:
+                        all_data.append(clean_table)
 
-        # 如果有抓到表格資料，就把它存成 CSV 備用
-        if len(all_data) > 1:
-            df = pd.DataFrame(all_data[1:], columns=all_data[0])
-            # 1. 將全部都是空白的字串轉換為真正的 NaN
-            df.replace(r'^\s*$', np.nan, regex=True, inplace=True)
-            # 2. 刪除「整行」或「整列」全是 NaN 的垃圾資料
-            df.dropna(how='all', axis=1, inplace=True)
-            df.dropna(how='all', axis=0, inplace=True)
+        if all_data:
+            dfs = []
+            for table_data in all_data:
+                headers = table_data[0]
+                headers = [str(h) if h else f"未命名欄位_{i}" for i, h in enumerate(headers)]
+                df = pd.DataFrame(table_data[1:], columns=headers)
+                dfs.append(df)
 
-            # 3. 如果清洗完發現整個表格空了 (代表這是被誤判的圖表)，就放棄處理
-            if df.empty or len(df.columns) == 0:
-                logger.info(" [背景任務] 清洗後發現為無效表格(如長條圖誤判)，已捨棄。")
-                return False
-            null_ratio = df.isna().sum().sum() / df.size
-            if null_ratio > 0.5:
-                logger.info(f" [背景任務] 表格空值率高達 {null_ratio:.1%}，判定為圖表誤判，已捨棄。")
-                return False
-            df = df[df.iloc[:, 0].astype(str).str.strip() != ""]
-            df.columns = [re.split(r'[\s\n(]', str(col))[0] if pd.notna(col) else "Column" for col in df.columns]
+            # 🚀 垂直拼接所有表格
+            final_df = pd.concat(dfs, ignore_index=True)
 
-            # 存成 CSV (使用 utf-8-sig 確保 Excel 打開不會亂碼)
-            df.to_csv(csv_path, index=False, encoding='utf-8-sig')
-            logger.info(f"[背景任務] 提煉成功！已產生表格快取: {os.path.basename(csv_path)}")
+            try:
+                logger.info(" [背景任務] 啟動 ETL 預處理：正規化表格與清洗雜訊...")
+
+                # 🔥 0. 真・企業級表頭提升 (Header Promotion)
+                header_row_idx = -1
+                for idx, row in final_df.head(20).iterrows():
+                    row_str = "".join(row.astype(str)).upper()
+                    if "星期一" in row_str or "MON" in row_str or "TUE" in row_str:
+                        header_row_idx = idx
+                        break
+
+                if header_row_idx != -1:
+                    logger.info(f" [背景任務] 在第 {header_row_idx} 列找到真實表頭，執行提升...")
+
+                    chopped_info = ""
+                    if header_row_idx > 0:
+                        # 將表頭上方的所有廢棄列，全部轉成字串並接起來
+                        chopped_rows = final_df.iloc[:header_row_idx].fillna("").astype(str)
+                        chopped_info = " ".join([" ".join(row) for row in chopped_rows.values]).replace('nan',
+                                                                                                        '').strip()
+                        logger.info(f" [背景任務] 成功搶救表頭上方資訊：{chopped_info[:30]}...")
+
+                    new_headers = final_df.iloc[header_row_idx].astype(str).tolist()
+                    clean_headers = []
+                    for i, h in enumerate(new_headers):
+                        h = h.strip().replace('\n', '')
+                        if h == 'nan' or h == '':
+                            clean_headers.append(f"分類標籤_{i}")
+                        else:
+                            clean_headers.append(h)
+
+                    final_df.columns = clean_headers
+                    # 斷頭台落下：砍掉上方的資料
+                    final_df = final_df.iloc[header_row_idx + 1:].reset_index(drop=True)
+
+                    # 🚑 將搶救出來的備註，作為一個新欄位「醫院預約重要備註」塞回資料表！
+                    if chopped_info:
+                        final_df['醫院預約重要備註'] = chopped_info
+
+                # 1. 切分「左右並排」的表格
+                if len(final_df.columns) >= 10:
+                    logger.info(" [背景任務] 偵測到疑似左右並排表格，執行垂直切分與堆疊...")
+                    mid_idx = len(final_df.columns) // 2
+                    left_df = final_df.iloc[:, :mid_idx].copy()
+                    right_df = final_df.iloc[:, mid_idx:mid_idx * 2].copy()
+                    right_df.columns = left_df.columns.tolist()
+                    final_df = pd.concat([left_df, right_df], ignore_index=True)
+
+                # 2. 清除雜訊資料
+                noise_keywords = ['講座', '衛教', '常規疫苗', '整合', '說明會', '特別門診']
+                pattern = '|'.join(noise_keywords)
+                final_df = final_df[
+                    ~final_df.astype(str).apply(lambda x: x.str.contains(pattern, na=False)).any(axis=1)]
+
+                # 3. 終極除垢與格式化：消滅隱形空白與 NaN 填補
+                final_df.replace(r'\s+', '', regex=True, inplace=True)
+                final_df.replace('', np.nan, inplace=True)
+                final_df.replace('None', np.nan, inplace=True)
+                final_df.dropna(how='all', inplace=True)
+
+                # 4. 精準向下填補 (Forward Fill)：前 3 欄
+                final_df.iloc[:, :3] = final_df.iloc[:, :3].ffill()
+                final_df.fillna("", inplace=True)
+
+            except Exception as etl_e:
+                logger.error(f" [背景任務] ETL 清洗過程發生錯誤: {etl_e}")
+
+            # 存成 CSV
+            final_df.to_csv(csv_path, index=False, encoding='utf-8-sig')
+            logger.info(f" [背景任務] 表格提煉成功！已產生快取: {os.path.basename(csv_path)}")
             return True
         else:
-            logger.info(" [背景任務] 此 PDF 無表格，標記為純文字檔。")
+            logger.info(" [背景任務] 此 PDF 中未偵測到實體格線表格。")
             return False
 
     except Exception as e:
@@ -84,8 +137,9 @@ def extract_and_save_tables(pdf_path: str):
         return False
 
 
+# ==========================================
 # PART 1: 檔案讀取邏輯 (Loader)
-
+# ==========================================
 class FileLoader(ABC):
     def __init__(self, file_path, original_filename="未知檔案"):
         self.file_path = file_path
@@ -101,35 +155,22 @@ class PDFFileLoader(FileLoader):
         text_content = []
         try:
             doc = fitz.open(self.file_path)
-            # 初始化 OCR 引擎 (第一次跑會自動載入模型)
             ocr = RapidOCR()
-
             logger.info(f" 開始解析 PDF (啟用 OCR 雙重防護): {self.original_filename}")
 
             for i, page in enumerate(doc):
-                # 1. 先嘗試正規文字提取
                 page_text = page.get_text().strip()
-
-                # 2. 判斷是否為亂碼 (如果文字長度大於 20，但包含大量怪符號，或是像空空如也)
-                # 設定一個簡單的機制：如果抽出來的字不到 50 個字，或是包含特殊亂碼特徵，就強制啟用 OCR
                 if len(page_text) < 50 or "cid:" in page_text or "MNOP" in page_text:
                     logger.warning(f" 第 {i + 1} 頁偵測到亂碼或空文字，啟動 OCR 視覺提取...")
-
-                    # 將 PDF 該頁渲染成圖片 (dpi=150 足以辨識文字且不會太慢)
                     pix = page.get_pixmap(dpi=150)
-
-                    # 將 PyMuPDF 的圖片轉換為 OpenCV 格式給 OCR 看
                     img_array = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
-                    if pix.n == 4:  # 如果有 Alpha 通道，轉為 RGB
+                    if pix.n == 4:
                         img_array = cv2.cvtColor(img_array, cv2.COLOR_BGRA2BGR)
                     elif pix.n == 3:
                         img_array = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
 
-                    # 執行 OCR 辨識
                     result, _ = ocr(img_array)
-
                     if result:
-                        # result 包含 [框座標, 文字, 信心度]，我們只要文字
                         page_text = "\n".join([line[1] for line in result])
                     else:
                         page_text = ""
@@ -140,10 +181,8 @@ class PDFFileLoader(FileLoader):
                     text_content.append(f"[第 {i + 1} 頁：無文字內容]")
 
             doc.close()
-
             if not text_content:
                 return f"【檔案: {self.original_filename}】(無法提取文字)\n"
-
             return f"【檔案: {self.original_filename}】\n" + "\n\n".join(text_content)
 
         except Exception as e:
@@ -208,11 +247,9 @@ class ImageFileLoader(FileLoader):
             with open(self.file_path, "rb") as f:
                 img_bytes = f.read()
 
-            # 1. 啟動 RapidOCR 先行暴力抓字！
             ocr_text = "(無明顯文字)"
             try:
                 ocr = RapidOCR()
-                # 讀取圖片給 OCR
                 img_array = cv2.imread(self.file_path)
                 result, _ = ocr(img_array)
                 if result:
@@ -221,29 +258,21 @@ class ImageFileLoader(FileLoader):
             except Exception as e:
                 logger.warning(f"圖片 OCR 輔助失敗: {e}")
 
-            # 2. 將 OCR 抓到的字，當作作弊小抄交給 AI
             target_url = getattr(settings, "OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip('/') + "/api/chat"
-
-            # 修改 Prompt，把 OCR 結果塞進去
             enhanced_prompt = f"""You are an expert image analysis AI.
             The image contains the following text extracted by an OCR tool:
             [OCR TEXT START]
             {ocr_text}
             [OCR TEXT END]
-            
+
             Please describe the humor, context, and visual elements of this image in Traditional Chinese (繁體中文). Use the OCR text to help you understand the meme."""
 
             response = requests.post(
                 target_url,
                 json={
                     "model": model_name,
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": enhanced_prompt,
-                            "images": [base64.b64encode(img_bytes).decode('utf-8')]
-                        }
-                    ],
+                    "messages": [{"role": "user", "content": enhanced_prompt,
+                                  "images": [base64.b64encode(img_bytes).decode('utf-8')]}],
                     "stream": False,
                     "options": {"temperature": 0.1, "num_predict": 1024}
                 },
@@ -276,8 +305,9 @@ class FileLoaderFactory:
         return TextFileLoader(file_path, original_filename)
 
 
+# ==========================================
 # PART 2: 檔案上傳服務 (Service)
-
+# ==========================================
 class FileService:
     def __init__(self):
         self.upload_dir = os.path.join(os.getcwd(), "uploads")
@@ -285,23 +315,16 @@ class FileService:
         self.vector_store = VectorStoreService.get_instance()
 
     async def upload_file(self, file: UploadFile):
-        """上傳檔案 (累加模式，保留舊檔)"""
         try:
-
-            # 舊檔案會被保留
             file_path = os.path.join(self.upload_dir, file.filename)
-
-            # 1. 儲存實體檔案
             with open(file_path, "wb") as buffer:
                 shutil.copyfileobj(file.file, buffer)
 
             logger.info(f"檔案已儲存: {file.filename}")
 
-            # 檔案儲存後，若為 PDF，立刻在背景提煉表格
             if file_path.lower().endswith(".pdf"):
                 extract_and_save_tables(file_path)
 
-            # 2. 呼叫向量資料庫進行處理 (RAG 純文字向量化)
             await self.vector_store.process_file(file_path)
 
             return {
@@ -315,13 +338,11 @@ class FileService:
             raise e
 
     def get_files(self):
-        """列出所有檔案"""
         if not os.path.exists(self.upload_dir):
             return []
         return [f for f in os.listdir(self.upload_dir) if os.path.isfile(os.path.join(self.upload_dir, f))]
 
     def clear_all_files(self):
-        """只有按 PURGE 按鈕時才清空"""
         try:
             if os.path.exists(self.upload_dir):
                 shutil.rmtree(self.upload_dir)

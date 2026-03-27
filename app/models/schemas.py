@@ -1,6 +1,6 @@
 # app/models/schemas.py
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 
 # 定義單條對話紀錄的格式 (完美對應前端狀態)
 class Message(BaseModel):
@@ -13,6 +13,6 @@ class Message(BaseModel):
 # 定義前端發送過來的請求格式
 class ChatRequest(BaseModel):
     query: str
-    model_name: str = "gemma3:27b"
-    history: List[Message] = []
-    images: List[str] = []  # 接住本次對話要傳給大模型的 Base64 圖片陣列
+    history: List[Dict[str, Any]] = []
+    images: Optional[List[str]] = None
+    model_name: Optional[str] = None  # 允許前端傳送模型名稱

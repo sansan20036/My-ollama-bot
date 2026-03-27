@@ -32,12 +32,15 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 async def chat_endpoint(request: ChatRequest):
     """對話 API (包含歷史紀錄改寫)"""
     try:
-        history_data = [m.model_dump() for m in request.history]
-
         # 把前端傳來的 Base64 圖片陣列一起送進大腦
         return StreamingResponse(
-            chat_service.process_query(request.query, history_data, request.images),
-            media_type="text/plain"
+            chat_service.process_query(
+                query=request.query,
+                history=request.history,
+                images=request.images,
+                model_name=request.model_name
+            ),
+            media_type="text/event-stream"
         )
     except Exception as e:
         logger.error(f"Chat Error: {e}")
@@ -48,24 +51,29 @@ async def chat_endpoint(request: ChatRequest):
 async def get_models():
     """從 Ollama 伺服器動態抓取模型列表"""
     try:
-        # 修正 1：確保 base_url 只包含主機與 Port，不要有後面的路徑
         base_url = getattr(settings, "OLLAMA_BASE_URL", "http://git.tedpc.com.tw:11434")
-
-        # 修正 2：移除網址結尾可能的斜線，確保拼接正確
         base_url = base_url.rstrip('/')
         target_url = f"{base_url}/api/tags"
 
         async with httpx.AsyncClient() as client:
-            # 修正 3：將 timeout 稍微拉長，避免遠端網路延遲導致誤判
-            response = await client.get(target_url, timeout=10.0)
+            # 👇 關鍵修正：建立帶有金鑰的 Header
+            headers = {
+                "Authorization": f"Bearer {settings.OLLAMA_API_KEY}",
+                "Content-Type": "application/json"
+            }
+
+            # 👇 在請求中帶上 headers
+            response = await client.get(target_url, headers=headers, timeout=10.0)
+
             if response.status_code == 200:
                 return response.json()
             else:
+                # 這樣你下次報錯就能在 Log 看到為什麼失敗了
                 logger.error(f"Ollama 回應錯誤: {response.status_code} - {response.text}")
                 return {"models": []}
+
     except Exception as e:
         logger.error(f"無法連線到 Ollama: {str(e)}")
-        # 建議：測試階段先不要寫死假資料，讓它回傳空陣列，這樣你前端或 Log 才看得出真的斷線了
         return {"models": []}
 
 

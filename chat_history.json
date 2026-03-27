@@ -1,0 +1,14 @@
+[
+  {
+    "role": "system",
+    "content": "你是專業的中文助手，回答請精簡。"
+  },
+  {
+    "role": "user",
+    "content": "你好"
+  },
+  {
+    "role": "assistant",
+    "content": "你好！有什麼我可以幫忙的？\n"
+  }
+]

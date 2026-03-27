@@ -1,14 +1,16 @@
+# app/services/vector_store.py
 import logging
 import os
 import shutil
+import re
 from typing import List, Optional, Dict, Any
 
 from langchain_chroma import Chroma
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_ollama import OllamaEmbeddings
 from langchain_core.documents import Document
 
 from app.core.config import settings
-from app.utils.smart_parser import SmartFileParser  # 確保這支程式已存在
+from app.utils.smart_parser import SmartFileParser
 
 logger = logging.getLogger(__name__)
 
@@ -18,8 +20,15 @@ class VectorStoreService:
 
     def __init__(self):
         # 初始化 Embedding 模型
-        # 使用 HuggingFace 模型將文字轉為向量
-        self.embeddings = HuggingFaceEmbeddings(model_name=settings.EMBEDDING_MODEL)
+        self.embeddings = OllamaEmbeddings(
+            model=settings.EMBEDDING_MODEL,  # 會讀取 config 中的 "nomic-embed-text:latest"
+            base_url=settings.OLLAMA_BASE_URL,  # 公司伺服器網址
+            client_kwargs={
+                "headers": {
+                    "Authorization": f"Bearer {settings.OLLAMA_API_KEY}"
+                }
+            }
+        )
         self._init_db()
 
     def _init_db(self):
@@ -37,12 +46,9 @@ class VectorStoreService:
         return cls._instance
 
     def add_documents(self, docs: List[Document]):
-        """
-        將文件存入向量資料庫 (同步方法)
-        """
+        """將文件存入向量資料庫 (同步方法)"""
         if docs:
             try:
-                # ChromaDB 的 add_documents 會自動處理 ID 和向量化
                 self.db.add_documents(docs)
                 logger.info(f"成功存入 {len(docs)} 筆向量資料片段")
             except Exception as e:
@@ -50,71 +56,91 @@ class VectorStoreService:
                 raise e
 
     async def process_file(self, file_path: str):
-        """
-        核心流程：讀取 -> 智慧解析 -> 儲存
-        """
+        """核心流程：支援 PDF 逐頁讀取 (Lazy Loading) 防 OOM 引擎，其他檔案維持智能解析"""
         try:
-            # 避免循環引用，在函式內 import
-            from app.services.file_service import FileLoaderFactory
-
             filename = os.path.basename(file_path)
+            file_ext = filename.lower().split('.')[-1]
 
-            # 1. 讀取原始文字 (使用 FileLoaderFactory)
-            loader = FileLoaderFactory.get_loader(file_path, filename)
-            text_content = loader.extract_text()
+            # 升級改造：針對 PDF 啟用「一頁一頁讀取」的 Lazy Load 模式
+            if file_ext == 'pdf':
+                from langchain_community.document_loaders import PyMuPDFLoader
+                from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-            if not text_content:
-                logger.warning(f"檔案 {filename} 無內容或無法讀取，跳過處理")
-                return
+                logger.info(f"啟動 PDF 逐頁解析引擎: {filename}")
 
-            # 2.啟動 SmartFileParser 進行結構化解析
-            logger.info(f" 啟動 SmartFileParser 解析檔案: {filename}")
-            parser = SmartFileParser()
+                loader = PyMuPDFLoader(file_path)
+                text_splitter = RecursiveCharacterTextSplitter(
+                    chunk_size=1000,
+                    chunk_overlap=150
+                )
 
-            # 這會回傳一系列帶有豐富 metadata (如 article_id, type) 的 Document 物件
-            docs = parser.parse(text_content, filename)
+                page_count = 0
+                global_chunk_count = 0  # 關鍵新增：全域片段計數器，用來維持文章順序！
 
-            # 3. 存入資料庫
-            if docs:
-                self.add_documents(docs)
-                logger.info(f"檔案 '{filename}' 處理完成，共存入 {len(docs)} 筆結構化資料")
+                for page_doc in loader.lazy_load():
+                    page_count += 1
+                    logger.info(f"正在處理 {filename} 的第 {page_count} 頁...")
+
+                    # --- 文字清洗機 ---
+                    raw_text = page_doc.page_content
+                    clean_text = re.sub(r'-\n\s*', '', raw_text)  # 修復跨行斷字
+                    clean_text = re.sub(r'(?:\b[a-zA-Z]{1,2}\b\s+){4,}', ' [數學公式/圖表] ', clean_text)  # 碎字殺手
+                    clean_text = re.sub(r'\s+', ' ', clean_text)  # 壓縮空白
+                    page_doc.page_content = clean_text
+
+                    # --- 強化 Metadata ---
+                    page_doc.metadata["source"] = filename
+                    page_doc.metadata["page"] = page_doc.metadata.get("page", page_count)
+
+                    # --- 切塊並打上順序 ID ---
+                    chunks = text_splitter.split_documents([page_doc])
+                    for chunk in chunks:
+                        chunk.metadata["chunk_id"] = global_chunk_count
+                        global_chunk_count += 1
+
+                    # 存入資料庫
+                    if chunks:
+                        self.add_documents(chunks)
+
+                logger.info(f"PDF '{filename}' 處理完成，共安全解析 {page_count} 頁")
+
+            # 其他檔案 (如 txt, csv, docx) 維持 SmartParser 邏輯
             else:
-                logger.warning(f"檔案 '{filename}' 解析後無有效資料片段")
+                from app.services.file_service import FileLoaderFactory
+
+                loader = FileLoaderFactory.get_loader(file_path, filename)
+                text_content = loader.extract_text()
+
+                if not text_content:
+                    logger.warning(f"檔案 {filename} 無內容或無法讀取，跳過處理")
+                    return
+
+                logger.info(f"啟動 SmartFileParser 解析檔案: {filename}")
+                parser = SmartFileParser()
+                docs = parser.parse(text_content, filename)
+
+                if docs:
+                    self.add_documents(docs)
+                    logger.info(f" 檔案 '{filename}' 處理完成，共存入 {len(docs)} 筆結構化資料")
+                else:
+                    logger.warning(f"檔案 '{filename}' 解析後無有效資料片段")
 
         except Exception as e:
-            logger.error(f"處理檔案失敗 {file_path}: {e}")
+            logger.error(f" 處理檔案失敗 {file_path}: {e}")
             raise e
-    # 定義搜尋動作的地方
+
     def search(self, query: str, k: int = 4, filter: Optional[Dict[str, Any]] = None):
-        """
-        執行向量相似度搜尋
-        Args:
-            query: 搜尋關鍵字
-            k: 回傳筆數
-            filter: Metadata 過濾條件 (例如 {"article_id": "12"})
-        """
+        """執行向量相似度搜尋 (已修復重複邏輯)"""
         if filter:
-            # 如果有指定 filter，使用帶過濾的搜尋
             return self.db.similarity_search(query, k=k, filter=filter)
-        else:
-            # 一般搜尋
-            return self.db.similarity_search(query, k=k)
+        return self.db.similarity_search(query, k=k)
 
     def list_sources(self):
-        """
-        列出目前資料庫中所有不重複的檔案名稱
-        """
+        """列出目前資料庫中所有不重複的檔案名稱"""
         try:
-            # 只抓取 metadata，不抓 embedding 向量，速度快
             data = self.db.get(include=['metadatas'])
             metadatas = data.get("metadatas", [])
-
-            sources = set()
-            if metadatas:
-                for m in metadatas:
-                    if m and "source" in m:
-                        sources.add(m["source"])
-
+            sources = {m["source"] for m in metadatas if m and "source" in m}
             return sorted(list(sources))
         except Exception as e:
             logger.error(f"Error listing sources: {e}")
@@ -123,12 +149,9 @@ class VectorStoreService:
     def delete_file(self, filename: str):
         """刪除指定檔案的所有向量資料"""
         try:
-            # 1. 找出該檔案對應的所有 ID
             data = self.db.get(where={"source": filename})
             ids = data.get("ids", [])
-
             if ids:
-                # 2. 根據 ID 刪除
                 self.db.delete(ids)
                 logger.info(f"已刪除檔案 '{filename}'，共移除 {len(ids)} 筆向量片段")
                 return True
@@ -142,7 +165,6 @@ class VectorStoreService:
     def get_file_content(self, filename: str) -> str:
         """讀取指定檔案的完整內容 (將切片縫合，用於前端預覽)"""
         try:
-            # 根據 source 抓取所有片段
             data = self.db.get(where={"source": filename})
             documents = data.get("documents", [])
             metadatas = data.get("metadatas", [])
@@ -150,15 +172,10 @@ class VectorStoreService:
             if not documents:
                 return "無內容或是圖片檔案 (未儲存純文字)。"
 
-            # 嘗試根據 'chunk_index' 或 'article_id' 排序，讓縫合後的文字順序正確
-            combined = zip(documents, metadatas)
+            # 根據 chunk_id 排序，確保縫合後的文字順序 100% 正確
+            combined = sorted(zip(documents, metadatas), key=lambda x: x[1].get('chunk_id', 0) if x[1] else 0)
+            sorted_docs = [doc for doc, meta in combined]
 
-            # 優先嘗試用 metadata 裡的 chunk_id 排序，如果沒有就保持原樣
-            try:
-                sorted_combined = sorted(combined, key=lambda x: x[1].get('chunk_id', 0) if x[1] else 0)
-                sorted_docs = [doc for doc, meta in sorted_combined]
-            except:
-                sorted_docs = documents
             return "\n\n-------------------\n\n".join(sorted_docs)
 
         except Exception as e:
@@ -168,17 +185,14 @@ class VectorStoreService:
     def reset(self):
         """強制清空資料庫 (Purge System)"""
         try:
-            # 1. 嘗試從 Chroma 刪除所有資料
             all_ids = self.db.get()['ids']
             if all_ids:
-                # Chroma 限制一次刪除數量，分批刪除較安全
                 batch_size = 5000
                 for i in range(0, len(all_ids), batch_size):
                     batch_ids = all_ids[i:i + batch_size]
                     self.db.delete(batch_ids)
                 logger.info(f"️已從 Chroma 刪除 {len(all_ids)} 筆資料")
 
-            # 2. 重新初始化
             self.db = None
             self._init_db()
             logger.info("資料庫重置完成")

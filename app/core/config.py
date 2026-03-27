@@ -10,10 +10,11 @@ class Settings(BaseSettings):
 
     # Ollama 連線設定
     OLLAMA_BASE_URL: str = "http://git.tedpc.com.tw:11434"
-    OLLAMA_MODEL: str = "gemma3:26b"
+    OLLAMA_MODEL: str = "gemma3:27b"
+    OLLAMA_API_KEY: str = ""
 
     # 向量與 Embedding 設定
-    EMBEDDING_MODEL: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+    EMBEDDING_MODEL: str = "nomic-embed-text:latest"
 
     # 自動計算路徑:BASE_DIR 會自動抓到 app 資料夾的上一層 (也就是專案根目錄)
     BASE_DIR: str = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

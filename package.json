@@ -25,7 +25,8 @@
   "scripts": {
     "dev": "vite --open",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "lint": "eslint ."
   },
   "eslintConfig": {
     "extends": [
@@ -47,6 +48,9 @@
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^5.1.4",
+    "eslint-plugin-react": "^7.37.5",
+    "eslint-plugin-react-hooks": "^5.1.0",
+    "eslint-plugin-react-refresh": "^0.4.26",
     "vite": "^7.3.1"
   }
 }

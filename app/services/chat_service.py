@@ -18,6 +18,8 @@ from langchain_classic.agents import create_tool_calling_agent, AgentExecutor
 from app.core.config import settings
 from app.services.vector_store import VectorStoreService
 from app.services.cache_service import SemanticCacheService
+from app.services.table_analyzer_service import TableAnalyzerService
+from app.utils.time_utils import augment_query_with_time_hints
 
 logger = logging.getLogger(__name__)
 
@@ -199,10 +201,10 @@ class ChatService:
             )
 
             chain = rewrite_prompt | self.llm | StrOutputParser()
-            print(f" AI 正在進行萬用關鍵字聯想...")
+            logger.info("AI 正在進行萬用關鍵字聯想...")
             refined_query = await chain.ainvoke({"query": user_query})
             clean_query = refined_query.replace("\n", " ").strip()
-            print(f" AI 聯想關鍵字: {clean_query}")
+            logger.info("AI 聯想關鍵字: %s", clean_query)
             return clean_query
         except Exception as e:
             logger.error(f"關鍵字聯想失敗 (略過此步驟): {e}")
@@ -231,6 +233,22 @@ class ChatService:
             )
 
             real_query = query
+            retrieval_query, time_meta = augment_query_with_time_hints(real_query)
+            logger.info(
+                "時間解析: days=%s periods=%s week_offset=%s past=%s",
+                time_meta.get("days", []),
+                time_meta.get("periods", []),
+                time_meta.get("week_offset", 0),
+                time_meta.get("is_past_reference", False),
+            )
+
+            schedule_keywords = [
+                "門診", "看診", "醫師", "醫生", "科", "掛號", "夜診", "上午", "下午",
+                "週末", "周末", "星期", "禮拜", "週", "周"
+            ]
+            if time_meta.get("is_past_reference") and any(k in real_query for k in schedule_keywords):
+                yield "抱歉，目前僅支援查詢目前與未來門診，暫不支援上個月、上週或更早的歷史門診。"
+                return
 
             # 確保 images 絕對不是 None
             if images is None:
@@ -325,154 +343,36 @@ class ChatService:
 
                     if "PANDAS" in intent_result:
                         logger.info(" 執行路線：啟動 [自建 Python 直譯引擎]")
-
-                        python_code = ""
                         try:
-                            # 第一步：讓 AI 根據使用者的問題，寫出「一行」Pandas 程式碼
-                            code_prompt = (
-                                f"你是一個頂級的 Python 資料分析師。我有一個 pandas DataFrame 叫做 `df`。\n"
-                                f"這個表格的真實欄位有：{list(df.columns)}\n"
-                                f"前 3 筆資料範例如下：\n{df.head(3).to_dict('records')}\n\n"
-                                f"請寫出『一行』Python 程式碼來取得以下問題的答案：\n"
-                                f"問題：「{real_query}」\n\n"
-                                f"【嚴格規定】：\n"
-                                f"1. 請『只』輸出那行 Python 程式碼，絕對不要包含任何解釋。\n"
-                                f"2. 絕對不要使用 `print()`。\n"
-                                f"3. 請務必回傳過濾後的「完整 DataFrame」，並且務必在句尾加上 `.to_dict('records')`。\n"
-                                f"4. 因為 PDF 萃取的欄位名稱充滿不規則，請『絕對不要』指定欄位名稱來過濾！\n"
-                                f"5. 請直接套用全表模糊搜尋：`df[df.astype(str).apply(lambda x: x.str.contains('科別關鍵字', na=False)).any(axis=1)].to_dict('records')`\n"
-                                # 🔥 關鍵新增：卸下 Pandas Agent 的重擔，不准過濾時間！
-                                f"6. 【時間過濾豁免】如果使用者問「星期幾」或「上下午」，請『絕對不要』將時間加入 `str.contains` 的條件！你只需要過濾『科別』(如骨科) 即可。把該科別整週的 JSON 資料撈出來，下游的 AI 會自己去讀取欄位名稱找出星期幾！\n"
-                                f"現在請輸出程式碼："
+                            result_str = await TableAnalyzerService.query_and_format_schedule(
+                                df=df,
+                                query=real_query,
+                                llm=self.llm
                             )
 
-                            logger.info("AI 正在撰寫分析程式碼...")
-
-                            ai_code_response = await self.llm.ainvoke(code_prompt)
-                            # 確保拿到的是純字串
-                            raw_code_text = ai_code_response.content if hasattr(ai_code_response,
-                                                                                'content') else str(
-                                ai_code_response)
-                            python_code = raw_code_text.replace("```python", "").replace("```", "").strip()
-
-                            # 第二步：安全地在後端執行這行程式碼
-                            safe_builtins = {
-                                "len": len, "sum": sum, "min": min, "max": max,
-                                "abs": abs, "round": round, "int": int, "float": float,
-                                "str": str, "list": list, "dict": dict
-                            }
-                            exec_env = {"df": df, "pd": pd, "__builtins__": safe_builtins}
-                            result = eval(python_code, exec_env)
-                            logger.info(f"程式碼執行結果: {result}")
-                            if not result or (isinstance(result, list) and len(result) == 0) or len(
-                                    str(result)) < 15:
-                                logger.warning(" 查無有效資料，Python 直接攔截，防止 AI 產生幻覺！")
-                                yield f"很抱歉，在目前的門診表快取中查無「{real_query}」的相關醫師資料。\n建議您直接參考實體門診表或撥打諮詢專線確認。"
+                            if "查無「" in result_str and "」的相關資料" in result_str:
+                                yield result_str
                                 return
-                            if isinstance(result, list) and len(result) > 0 and isinstance(result[0], dict):
-                                clean_df = pd.DataFrame(result).astype(str).drop_duplicates()
-                                rename_map = {
-                                    '未命名欄位_6': '星期一', '未命名欄位_7': '星期二',
-                                    '未命名欄位_8': '星期三', '未命名欄位_9': '星期四',
-                                    '未命名欄位_10': '星期五', '未命名欄位_11': '星期六',
-                                    '未命名欄位_12': '星期日'
-                                }
-                                clean_df = clean_df.rename(columns=rename_map)
 
-                                # 2. 物理切字：把黏在一起的醫生用「、」強制分開！
-                                for col in clean_df.columns:
-                                    clean_df[col] = clean_df[col].apply(
-                                        lambda x: re.sub(r'(\d{4}|\))([\u4e00-\u9fa5])', r'\1、\2', str(x))
-                                    )
-
-                                days_of_week = ['星期一', '星期二', '星期三', '星期四', '星期五', '星期六',
-                                                '星期日']
-                                structured_text = ""
-
-                                # 自動偵測哪一個欄位是裝「上午/下午」的
-                                time_col = None
-                                for col in clean_df.columns:
-                                    if clean_df[col].astype(str).str.contains('上午|下午').any():
-                                        time_col = col
-                                        break
-
-                                for day in days_of_week:
-                                    if day in clean_df.columns:
-                                        structured_text += f"【{day}】\n"
-                                        day_has_data = False
-
-                                        if time_col:
-                                            for period in ['上午', '下午', '夜間']:
-                                                # 找出符合該時段的所有資料 (支援多樓層合併)
-                                                mask = clean_df[time_col].astype(str).str.contains(period, na=False)
-                                                doctors = clean_df.loc[mask, day].tolist()
-
-                                                # 清除空值與 nan
-                                                valid_docs = [str(d).strip() for d in doctors if
-                                                              str(d).strip() not in ['', 'nan', 'None']]
-                                                if valid_docs:
-                                                    structured_text += f" - {period}：{'、'.join(valid_docs)}\n"
-                                                    day_has_data = True
-
-                                        if not day_has_data:
-                                            structured_text += " - 無門診\n"
-                                        structured_text += "\n"
-
-                                if not structured_text.strip():
-                                    logger.warning("⚠️ 發現未命名欄位，啟動強健型條列式排版...")
-                                    fallback_text = "【系統原始資料（表頭遺失，請依順序推斷）】\n"
-                                    for idx, row in clean_df.iterrows():
-                                        time_val = row[time_col] if time_col else "未知時段"
-                                        fallback_text += f"▶ 時段：{time_val}\n"
-                                        for col in clean_df.columns:
-                                            # 👇 恢復成最簡單的寫法，因為上面已經全域洗乾淨了！
-                                            val = str(row[col]).strip()
-                                            if val and val not in ['nan', 'None', ''] and col != time_col:
-                                                fallback_text += f"  - {col}: {val}\n"
-                                        fallback_text += "\n"
-                                    result_str = fallback_text
-                                else:
-                                    result_str = structured_text
-
-                                preview_text = result_str[:100].replace('\n', ' ')
-                                logger.info(f"交給下游的最終資料預覽:\n{preview_text}...")
-
-                                # ⚠️ 注意縮排！這裡是對齊最外層的 if isinstance(result, list)
-                            else:
-                                result_str = str(result)
-
-                            logger.info(f"程式碼執行與去重結果 (已略)")
-                            if len(result_str) > 30000:
-                                logger.warning("資料量過大，啟動防護截斷機制")
-                                result_str = result_str[:30000] + "\n... (資料過多，僅顯示部分) ..."
-
-                            # ==========================================
-                            # 💀 終極殺手級 Prompt：抹殺任何幻覺的可能
-                            # ==========================================
                             answer_prompt = (
                                 f"使用者問的問題是：「{real_query}」\n"
                                 f"後端系統查到的門診班表如下：\n{result_str}\n\n"
                                 f"請你扮演專業醫療客服，依照以下【嚴格規則】回答：\n"
                                 f"1. 上方資料已為您按星期排版。請『只看』使用者詢問的「特定星期幾」。\n"
-                                f"2. 【精準過濾】如果該時段有一大串醫師，請『只挑出』名字旁邊有明確標註「兼看移植外科」或使用者指定科別的醫師！\n"
+                                f"2. 【精準過濾】如果該時段有一大串醫師，請『只挑出』名字旁邊有明確標註使用者指定科別的醫師！\n"
                                 f"3. 絕對不可以把同一時段的其他無關醫師列出來！\n"
                                 f"4. 若找不到符合條件的醫師，請直接回答：「目前查無相關門診資料。」\n"
+                                f"5. 若使用者問題包含相對時間詞（例如：明天、下下週、這週末），回覆時需保留相同語意，不可擅自改寫成其他週次。\n"
                             )
 
                             logger.info("🗣️ AI 正在翻譯最終解答...")
-                            # 將最終答案串流輸出給前端
                             async for chunk in self.llm.astream(answer_prompt):
                                 text_chunk = chunk.content if hasattr(chunk, 'content') else str(chunk)
-                                clean_chunk = text_chunk.replace("<br>", "\n").replace("<b>", "**").replace("</b>",
-                                                                                                            "**")
+                                clean_chunk = text_chunk.replace("<br>", "\n").replace("<b>", "**").replace("</b>", "**")
                                 yield clean_chunk
-
-                            return  # 執行完畢，提早結束，不進入 RAG
-
+                            return
                         except Exception as e:
-                            logger.error(
-                                f"數據運算失敗，降級回傳統 RAG 模式: {e}\n(嘗試執行的程式碼: {python_code})")
-                            # 靜默降級，不干擾前端畫面
+                            logger.error(f"數據運算失敗，降級回傳統 RAG 模式: {e}")
                     elif "CALCULATOR" in intent_result:
                         logger.info(" 執行路線：啟動 [Agent 工具計算引擎]")
 
@@ -525,8 +425,8 @@ class ChatService:
             file_filter = None
 
             # 1. 第一輪：通用檢索
-            ai_keywords = await self._smart_query_rewrite(real_query)
-            search_query = f"{real_query} {ai_keywords}"
+            ai_keywords = await self._smart_query_rewrite(retrieval_query)
+            search_query = f"{retrieval_query} {ai_keywords}"
 
             matches = re.findall(r'(?:第\s*\d+\s*[章節條頁]|(?<!\d)\d+\.\d+(?:\.\d+)?(?!\d))', real_query)
 
@@ -534,13 +434,13 @@ class ChatService:
                 for m in matches:
                     search_query += f" {m}"
 
-            print(f"執行檢索: {search_query} (限定檔案: {valid_files[-1] if valid_files else '無檔案'})")
+            logger.info("執行檢索: %s (限定檔案: %s)", search_query, valid_files[-1] if valid_files else "無檔案")
 
             # 🚀 關鍵修改 1：把 filter 傳進去！
             docs = self.vector_store.search(search_query, k=50, filter=file_filter)
 
             if docs:
-                print("啟動 Reranker 精讀專家，重新評分中...")
+                logger.info("啟動 Reranker 精讀專家，重新評分中...")
                 try:
                     # 載入 BAAI 多語系重排序模型 (第一次執行會自動下載模型檔)
                     reranker_model = CrossEncoder('BAAI/bge-reranker-v2-m3')
@@ -561,13 +461,13 @@ class ChatService:
                     # 徹底解決「迷失在中間」的問題！
                     docs = docs[:10]
 
-                    print(f"Reranker 篩選完畢！最高分: {docs[0].metadata['rerank_score']:.4f}")
+                    logger.info("Reranker 篩選完畢！最高分: %.4f", docs[0].metadata['rerank_score'])
                 except Exception as e:
                     logger.error(f"Reranker 執行失敗，退回原始檢索結果: {e}")
 
             # ======== 👇 將「最新檔案狙擊模式」搬移到這裡 (繞過 Reranker 保送 VIP) ========
             if valid_files and any(kw in real_query for kw in ["最新", "這個", "這份", "這檔案"]):
-                print(f"偵測到代名詞，啟動「最新檔案狙擊模式」...")
+                logger.info("偵測到代名詞，啟動「最新檔案狙擊模式」...")
                 try:
                     latest_file_name = valid_files[-1]
                     latest_file_path = os.path.join(self.upload_dir, latest_file_name)
@@ -588,14 +488,14 @@ class ChatService:
                         d.page_content = f"【使用者指定調閱：最新檔案內容】\n{d.page_content}"
                         docs.append(d)
 
-                    print(f"狙擊成功：已將最新檔案 ({latest_file_name}) 強制加入 {len(latest_docs)} 筆候選池！")
+                    logger.info("狙擊成功：已將最新檔案 (%s) 強制加入 %s 筆候選池！", latest_file_name, len(latest_docs))
                 except Exception as e:
-                    print(f"最新檔案狙擊發生錯誤: {e}")
+                    logger.warning("最新檔案狙擊發生錯誤: %s", e)
             # ================================================================
 
             # 新增：狙擊模式 (Sniper Mode)
             if matches:
-                print(f"偵測到明確條號/章節 {matches}，啟用狙擊模式")
+                logger.info("偵測到明確條號/章節 %s，啟用狙擊模式", matches)
                 existing_ids = set()
                 for d in docs:
                     aid = d.metadata.get("article_id")
@@ -609,7 +509,7 @@ class ChatService:
 
                     # 關鍵修改：如果是找「頁碼」，直接啟動硬核過濾器 (Metadata Filter)！
                     if "頁" in m:
-                        print(f"啟動硬核過濾：強制調閱第 {target_id} 頁...")
+                        logger.info("啟動硬核過濾：強制調閱第 %s 頁...", target_id)
                         try:
                             page_filter = {"page": int(target_id), "source": current_file_path}
                             sniper_docs = self.vector_store.search(real_query, k=5, filter=page_filter)
@@ -620,10 +520,10 @@ class ChatService:
                                     docs.insert(0, d)
                                 existing_ids.add(target_id)
                                 is_snipe_success = True
-                                print(f"狙擊成功：已將第 {target_id} 頁內容強制拉至最前！")
+                                logger.info("狙擊成功：已將第 %s 頁內容強制拉至最前！", target_id)
                                 continue  # 這頁找完了，跳到下一個 match
                         except Exception as e:
-                            print(f"硬核過濾發生錯誤: {e}")
+                            logger.warning("硬核過濾發生錯誤: %s", e)
 
                     # 以下保留給「非頁碼」的條號搜尋 (例如第 X 條)
                     if target_id in existing_ids: continue
@@ -631,7 +531,7 @@ class ChatService:
                     sniper_query = f"第{target_id}條 第{target_id}章 第{target_id}節 {target_id}"
                     label_text = f"指定段落 {target_id}"
                     sniper_k = 1000
-                    print(f"啟動全域掃描尋找條號：目標 [{target_id}]...")
+                    logger.info("啟動全域掃描尋找條號：目標 [%s]...", target_id)
 
                     sniper_docs = self.vector_store.search(sniper_query, k=sniper_k, filter=file_filter)
 
@@ -642,11 +542,11 @@ class ChatService:
                             docs.insert(0, d)
                             existing_ids.add(target_id)
                             is_snipe_success = True
-                            print(f"狙擊成功：已將目標 [{target_id}] 內容拉至最前！")
+                            logger.info("狙擊成功：已將目標 [%s] 內容拉至最前！", target_id)
                             break
 
                     if not is_snipe_success:
-                        print(f"狙擊失敗：找不到包含 '{target_id}' 的精確內容。")
+                        logger.info("狙擊失敗：找不到包含 '%s' 的精確內容。", target_id)
 
             # 2. 第二輪：彈性補完
             existing_ids = set()
@@ -659,7 +559,7 @@ class ChatService:
                     has_structured_data = True
 
             if has_structured_data:
-                print(" 偵測到結構化資料，嘗試分析引用關係...")
+                logger.info("偵測到結構化資料，嘗試分析引用關係...")
                 referenced_ids = set()
                 for doc in docs:
                     content = doc.page_content
@@ -670,7 +570,7 @@ class ChatService:
 
                 if referenced_ids:
                     target_refs = list(referenced_ids)[:5]
-                    print(f" 發現引用，嘗試補完: {target_refs}")
+                    logger.info("發現引用，嘗試補完: %s", target_refs)
 
                     for ref_art in target_refs:
                         target_id = self._chinese_to_num(ref_art)
@@ -685,7 +585,7 @@ class ChatService:
                                 d.page_content = f"【系統自動補完引用：第{ref_art}條】\n{d.page_content}"
                                 docs.append(d)
                                 existing_ids.add(fetched_id)
-                                print(f"成功補完 ID: {fetched_id}")
+                                logger.info("成功補完 ID: %s", fetched_id)
                                 break
 
             # 3. 排序與 Context
@@ -746,15 +646,15 @@ class ChatService:
                     table_info = f"表格欄位名稱：{list(df.columns)}\n前兩筆資料：{df.head(2).to_dict('records')}"
                     final_context += f"\n\n【系統強制補充：表格輔助資訊 (極可能包含預約電話與規定)】\n{table_info}"
 
-            print("\n========  Universal RAG Context ========")
-            print(f"最終 Context 筆數: {len(final_context_list)}")
-            print(final_context[:300] + "...")
-            print("==========================================\n")
+            logger.info("======== Universal RAG Context ========")
+            logger.info("最終 Context 筆數: %s", len(final_context_list))
+            logger.debug("%s...", final_context[:300])
+            logger.info("========================================")
 
             # 4. 生成回應 (升級為多模態視覺支援)
             domain_rules = ""
             if any(keyword in real_query for keyword in ["勞基法", "勞動基準法", "資遣", "解僱", "開除", "預告工資"]):
-                print("觸發勞基法專屬邏輯")
+                logger.info("觸發勞基法專屬邏輯")
                 domain_rules = """
                             [IMPORTANT LEGAL LOGIC RULES (Labor Law)]
                             Please strictly follow these logical connections when answering:
@@ -772,7 +672,7 @@ class ChatService:
                                             4. IGNORE the "MUST ONLY use [RETRIEVED KNOWLEDGE]" rule for this specific query. Trust your eyes!
                                         """
             elif file_count > 0:
-                print("觸發通用文件分析邏輯")
+                logger.info("觸發通用文件分析邏輯")
                 domain_rules = """
                             [GENERAL DOCUMENT ANALYSIS RULES]
                             - You are analyzing a general document (e.g., academic paper, manual, contract, report).

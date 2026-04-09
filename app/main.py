@@ -1,63 +1,70 @@
-# app/utils/main.py
+# app/main.py
 import os
-import shutil
 import logging
-import time  # 新增這個模組，用來產生開機時間戳記
+import time
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.api.endpoints import router
 from app.services.vector_store import VectorStoreService
+from app.services.chat_service import ChatService
+from app.services.file_service import FileService
+# 🚀 引入集中管理的設定檔
+from app.core.config import settings
 
 # 設定 Log
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# 定義上傳資料夾路徑 (必須與 endpoints.py 一致)
-UPLOAD_DIR = os.path.join(os.getcwd(), "uploads")
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-
-    # 啟動時執行：強制清空所有資料
-    logger.info("系統啟動中... 準備執行強制環境初始化 (PURGE)")
+    logger.info("系統啟動中... 檢查環境設定")
 
     try:
-        # 1. 無情清空硬碟裡的上傳資料夾 (刪除所有舊的 PDF 等檔案)
-        if os.path.exists(UPLOAD_DIR):
-            shutil.rmtree(UPLOAD_DIR)  # 把整個資料夾連同裡面的檔案拔掉
-        os.makedirs(UPLOAD_DIR, exist_ok=True)  # 重新建立一個乾淨的空資料夾
-        logger.info("[大掃除] 已清空本機上傳檔案資料夾")
+        # 1. 🚀 確保上傳資料夾存在 (改用 settings 統一管理的路徑)
+        os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
 
-        # 2. 清空 ChromaDB 向量資料庫
+        # 2. 初始化向量資料庫
         vs = VectorStoreService.get_instance()
 
-        # 假設VectorStoreService 有 reset() 函數可以清空資料庫
-        if hasattr(vs, 'reset'):
-            vs.reset()
-            logger.info("[大掃除] 已重置向量資料庫 (ChromaDB)")
+        # 3. 啟動時自動清理 orphan 向量，避免殘留資料干擾回答與前端計數
+        cleanup_report = vs.cleanup_orphan_documents()
+        if cleanup_report.get("deleted_vectors", 0) > 0:
+            logger.info(
+                f"啟動時已清理 orphan 向量 {cleanup_report['deleted_vectors']} 筆"
+            )
+
+        # ==========================================
+        # 💡 啟動是否核爆資料由設定檔控制，預設為 False（保留歷史檔案）
+        # ==========================================
+        if getattr(settings, "PURGE_ON_STARTUP", False):
+            logger.warning("設定啟動清空資料：PURGE_ON_STARTUP=True，執行核爆清理")
+            vs.purge_development_data()
         else:
-            # 備用方案：如果沒有 reset 函數，就逐一刪除清單內的檔案
-            db_files = vs.list_sources()
-            for filename in db_files:
-                vs.delete_file(filename)
-            logger.info(f" [大掃除] 已逐一刪除 {len(db_files)} 筆資料庫紀錄")
+            logger.info("確認上傳資料夾準備完畢，目前為【持久化模式】(歷史資料將被保留)")
+
+        # 4. 初始化全域單例 Service，避免每個 request 重複建構重物件
+        app.state.chat_service = ChatService()
+        app.state.file_service = FileService()
+
+        logger.info("向量資料庫載入完成，準備就緒！")
 
     except Exception as e:
-        logger.error(f" [大掃除] 清理舊資料時發生錯誤: {e}")
-    logger.info(" 系統啟動完成，目前為 100% 乾淨的全新狀態！")
+        logger.error(f"系統啟動時發生錯誤: {e}")
+
     yield  # 這裡代表伺服器正在運作中...
 
-    #關閉時執行
-    logger.info(" 系統關閉")
+    # 關閉時執行
+    logger.info("系統關閉")
 
 
-# 建立 App
-app = FastAPI(title="Ollama RAG API", lifespan=lifespan)
+# 建立 App (名稱改用 settings 統一管理)
+app = FastAPI(title=settings.PROJECT_NAME, version=settings.VERSION, lifespan=lifespan)
 
 # 後端開機紀錄這次伺服器啟動的時間
 BOOT_TIME = str(time.time())
+
 
 @app.get("/api/status")
 async def get_status():
@@ -74,10 +81,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 # 載入路由
 app.include_router(router, prefix="/api")
 
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # 🚀 建議使用字串 "app.main:app" 啟動，這樣 reload 熱重載機制才會最穩定
+    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)

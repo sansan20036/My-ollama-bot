@@ -1,7 +1,6 @@
 # app/services/cache_service.py
 import time
 import logging
-# 建議改用這個最新套件，就不會有警告了 (需執行 pip install -U langchain-ollama)
 from langchain_ollama import OllamaEmbeddings
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
@@ -24,8 +23,7 @@ class SemanticCacheService:
                 }
             }
         )
-        # 2. 補上消失的門檻值 (關鍵修正！)
-        # 距離越小越接近，0.35 是兼顧精準與速度的平衡點
+        # 2. 補上門檻值：距離越小越接近，0.35 是兼顧精準與速度的平衡點
         self.threshold = 0.35
 
         self._init_db()
@@ -46,7 +44,8 @@ class SemanticCacheService:
     def check_cache(self, query: str):
         """檢查是否有語意相近的快取答案"""
         start_time = time.time()
-        # 搜尋最像的一筆資料
+
+        # 🚀 這裡的 query (新問題) 將會去跟資料庫裡的 page_content (舊問題) 算距離！
         results = self.db.similarity_search_with_score(query, k=1)
 
         if results:
@@ -55,7 +54,9 @@ class SemanticCacheService:
             if score < self.threshold:
                 elapsed = time.time() - start_time
                 logger.info(f"[Cache Hit] 命中快取! (距離: {score:.4f} | 耗時: {elapsed:.4f}s)")
-                return doc.page_content
+
+                # 🚀 關鍵修正：命中舊問題後，把藏在 metadata 裡的「答案」拿出來還給使用者！
+                return doc.metadata.get("answer")
 
         return None
 
@@ -64,7 +65,8 @@ class SemanticCacheService:
         if not answer or len(answer) < 5:
             return
 
+        # 🚀 關鍵修正：把「問題」當作向量主體 (page_content)！把「答案」當作包裹塞進 metadata！
         self.db.add_documents([
-            Document(page_content=answer, metadata={"question": query})
+            Document(page_content=query, metadata={"answer": answer})
         ])
         logger.info(f" [Cache Update] 已將問答寫入快取")

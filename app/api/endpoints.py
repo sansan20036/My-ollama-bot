@@ -1,18 +1,21 @@
 # app/api/endpoints.py
 import logging
 import os
+import re
 import shutil
 from typing import List, Optional
 from uuid import uuid4
 
 import httpx
+import pandas as pd
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 
 from app.core.config import settings
-from app.models.schemas import ChatRequest
+from app.models.schemas import ChatRequest, ScheduleDebugRequest, ScheduleSmokeRequest
 from app.services.chat_service import ChatService
 from app.services.file_service import FileService
+from app.services.table_analyzer_service import TableAnalyzerService
 from app.services.vector_store import VectorStoreService
 
 router = APIRouter()
@@ -46,6 +49,83 @@ def get_file_service_from_app(request: Request) -> FileService:
         service = get_file_service()
         request.app.state.file_service = service
     return service
+
+
+def _load_dataframe_from_file(chat_service: ChatService, target_file: str) -> Optional[pd.DataFrame]:
+    """Load structured table DataFrame from cache/csv/xlsx/csv file."""
+    if not os.path.exists(target_file):
+        return None
+
+    current_mtime = os.path.getmtime(target_file)
+    if (
+        chat_service.cached_file_path == target_file
+        and chat_service.cached_file_mtime == current_mtime
+        and chat_service.cached_df is not None
+    ):
+        return chat_service.cached_df
+
+    file_name_without_ext = os.path.splitext(target_file)[0]
+    file_ext = target_file.lower().split(".")[-1]
+    possible_csv = f"{file_name_without_ext}_tables.csv"
+    df = None
+
+    if os.path.exists(possible_csv):
+        df = pd.read_csv(possible_csv)
+    elif file_ext in ["xlsx", "xls"]:
+        df = pd.read_excel(target_file)
+        df.columns = [re.split(r"[\s\n(]", str(col))[0] for col in df.columns]
+    elif file_ext == "csv":
+        df = pd.read_csv(target_file)
+        df.columns = [re.split(r"[\s\n(]", str(col))[0] for col in df.columns]
+
+    chat_service.cached_df = df
+    chat_service.cached_file_path = target_file
+    chat_service.cached_file_mtime = current_mtime
+    return df
+
+
+def _pick_target_filename(valid_files: List[str], requested_filename: Optional[str]) -> str:
+    if not valid_files:
+        raise HTTPException(status_code=400, detail="No uploaded files found.")
+    if requested_filename:
+        safe_name = os.path.basename(requested_filename.strip())
+        if safe_name not in valid_files:
+            raise HTTPException(status_code=404, detail=f"File not found in uploads: {safe_name}")
+        return safe_name
+    return valid_files[-1]
+
+
+async def _run_schedule_debug(chat_service: ChatService, query: str, requested_filename: Optional[str]) -> dict:
+    valid_files = chat_service._get_valid_files()
+    target_name = _pick_target_filename(valid_files, requested_filename)
+    target_file = os.path.join(UPLOAD_DIR, target_name)
+
+    df = _load_dataframe_from_file(chat_service, target_file)
+    if df is None or df.empty:
+        raise HTTPException(status_code=400, detail=f"Target file has no structured table data: {target_name}")
+
+    constraints = TableAnalyzerService._extract_constraints(query)
+    normalized_query = TableAnalyzerService._normalize_query_for_codegen(query)
+    inferred_dept = TableAnalyzerService._infer_department_keyword(query)
+    fallback_rows = TableAnalyzerService._fallback_by_department(df, normalized_query)
+    result_text = await TableAnalyzerService.query_and_format_schedule(df=df, query=query, llm=chat_service.llm)
+
+    return {
+        "query": query,
+        "target_file": target_name,
+        "normalized_query": normalized_query,
+        "inferred_department_keyword": inferred_dept,
+        "constraints": {
+            "include_days": sorted(list(constraints.get("include_days", set()))),
+            "exclude_days": sorted(list(constraints.get("exclude_days", set()))),
+            "include_periods": sorted(list(constraints.get("include_periods", set()))),
+            "exclude_periods": sorted(list(constraints.get("exclude_periods", set()))),
+            "surname": constraints.get("surname"),
+        },
+        "dataframe_shape": [int(df.shape[0]), int(df.shape[1])],
+        "fallback_row_count": len(fallback_rows),
+        "final_result": result_text,
+    }
 
 
 @router.post("/chat")
@@ -253,5 +333,50 @@ async def upload_files(
         }
     except Exception as e:
         logger.error(f"Upload error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/debug/schedule-eval")
+async def debug_schedule_eval(
+    payload: ScheduleDebugRequest,
+    chat_service: ChatService = Depends(get_chat_service_from_app),
+):
+    """Run one schedule query in debug mode and return intermediate filters/constraints."""
+    try:
+        q = (payload.query or "").strip()
+        if not q:
+            raise HTTPException(status_code=400, detail="query is required")
+        result = await _run_schedule_debug(chat_service, q, payload.filename)
+        return {"status": "ok", "result": result}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Debug schedule eval error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/debug/schedule-smoke")
+async def debug_schedule_smoke(
+    payload: ScheduleSmokeRequest,
+    chat_service: ChatService = Depends(get_chat_service_from_app),
+):
+    """
+    Run default smoke tests for schedule filtering:
+    1) 下下週週末 + 姓氏 + 科別
+    2) 科別 + 排除星期 + 排除時段
+    """
+    try:
+        queries = payload.queries or [
+            "幫我查下下週週末姓林的骨科醫生",
+            "我要看腸胃科，但不要星期一也不要上午，下週有哪些選擇",
+        ]
+        results = []
+        for q in queries:
+            results.append(await _run_schedule_debug(chat_service, q, payload.filename))
+        return {"status": "ok", "count": len(results), "results": results}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Debug schedule smoke error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 

@@ -210,8 +210,14 @@ class ChatService:
             logger.error(f"關鍵字聯想失敗 (略過此步驟): {e}")
             return ""  # 聯想失敗時優雅退回，不讓程式崩潰
 
-    async def process_query(self, query: str, history: list, images: list = None, model_name: str = None) -> \
-            AsyncGenerator[str, None]:
+    async def process_query(
+            self,
+            query: str,
+            history: list,
+            images: list = None,
+            model_name: str = None,
+            session_id: Optional[str] = None,
+    ) -> AsyncGenerator[str, None]:
         try:
             # 動態切換邏輯：有傳名字就用傳來的，沒有就用 config 預設的
             actual_model = model_name if model_name else settings.OLLAMA_MODEL
@@ -258,9 +264,17 @@ class ChatService:
             file_count = len(valid_files)
             file_list_str = self._get_sorted_file_list(valid_files)
 
-            # 修正 history 的取值，避免前端傳來缺少 content 的物件時報錯
-            history_text = "\n".join(
-                [f"{msg['role']}: {msg.get('content', '')}" for msg in history[-2:]]) if history else "(無歷史紀錄)"
+            # 相容 dict 與 Pydantic Message 兩種型別，避免 Message 物件不可下標錯誤
+            history_lines = []
+            for msg in (history[-2:] if history else []):
+                if isinstance(msg, dict):
+                    role = str(msg.get("role", ""))
+                    content = str(msg.get("content", ""))
+                else:
+                    role = str(getattr(msg, "role", ""))
+                    content = str(getattr(msg, "content", ""))
+                history_lines.append(f"{role}: {content}")
+            history_text = "\n".join(history_lines) if history_lines else "(無歷史紀錄)"
 
             # 雙模式架構分流器(聊天模式與檔案問答模式)
             if file_count == 0:
@@ -351,25 +365,11 @@ class ChatService:
                             )
 
                             if "查無「" in result_str and "」的相關資料" in result_str:
-                                yield result_str
+                                yield "目前查無符合您條件的門診資料。"
                                 return
 
-                            answer_prompt = (
-                                f"使用者問的問題是：「{real_query}」\n"
-                                f"後端系統查到的門診班表如下：\n{result_str}\n\n"
-                                f"請你扮演專業醫療客服，依照以下【嚴格規則】回答：\n"
-                                f"1. 上方資料已為您按星期排版。請『只看』使用者詢問的「特定星期幾」。\n"
-                                f"2. 【精準過濾】如果該時段有一大串醫師，請『只挑出』名字旁邊有明確標註使用者指定科別的醫師！\n"
-                                f"3. 絕對不可以把同一時段的其他無關醫師列出來！\n"
-                                f"4. 若找不到符合條件的醫師，請直接回答：「目前查無相關門診資料。」\n"
-                                f"5. 若使用者問題包含相對時間詞（例如：明天、下下週、這週末），回覆時需保留相同語意，不可擅自改寫成其他週次。\n"
-                            )
-
-                            logger.info("🗣️ AI 正在翻譯最終解答...")
-                            async for chunk in self.llm.astream(answer_prompt):
-                                text_chunk = chunk.content if hasattr(chunk, 'content') else str(chunk)
-                                clean_chunk = text_chunk.replace("<br>", "\n").replace("<b>", "**").replace("</b>", "**")
-                                yield clean_chunk
+                            # 直接回傳結構化結果，避免二次 LLM 改寫造成時間語意偏差或誤答。
+                            yield result_str
                             return
                         except Exception as e:
                             logger.error(f"數據運算失敗，降級回傳統 RAG 模式: {e}")
@@ -423,6 +423,10 @@ class ChatService:
             # 傳統 RAG 模式 (如果沒表格、或是意圖判定為閱讀理解，就會順暢地走到這裡)
             current_file_path = os.path.join(self.upload_dir, valid_files[-1]) if valid_files else ""
             file_filter = None
+            sid = (session_id or "").strip()
+            if sid:
+                file_filter = {"session_id": sid}
+                logger.info("已套用同批次檔案範圍(session_id=%s)", sid)
 
             # 1. 第一輪：通用檢索
             ai_keywords = await self._smart_query_rewrite(retrieval_query)

@@ -246,6 +246,21 @@ def extract_schedule_tables_with_hybrid_pipeline(pdf_path: str) -> tuple[bool, s
     return False, "none"
 
 
+def extract_pdf_tables_to_markdown_file(pdf_path: str) -> tuple[str, int]:
+    """
+    Export PDF tables as a markdown file alongside the original PDF.
+    Returns (md_path, table_count). md_path is empty when no table found.
+    """
+    md_text, table_count = extract_pdf_tables_to_markdown(pdf_path)
+    if table_count <= 0 or not md_text.strip():
+        return "", 0
+
+    md_path = pdf_path.rsplit(".", 1)[0] + "_tables.md"
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write(md_text.strip() + "\n")
+    return md_path, table_count
+
+
 def _is_probable_table_header_text(text: str) -> bool:
     t = _sanitize_cell_text(text).lower()
     if not t:
@@ -874,6 +889,21 @@ class FileService:
                 parse_mode = self._resolve_pdf_parse_mode(file_path)
                 logger.info(f"PDF 解析模式: {parse_mode}")
                 is_schedule_pdf = self._is_likely_medical_schedule_pdf(file_path)
+                md_path = ""
+                md_table_count = 0
+
+                # Export table markdown for all PDFs when possible.
+                # This makes table content directly answerable as text.
+                try:
+                    md_path, md_table_count = extract_pdf_tables_to_markdown_file(file_path)
+                    if md_table_count > 0:
+                        logger.info(
+                            f"已產生 PDF 表格 Markdown 快取：{os.path.basename(md_path)} (tables={md_table_count})"
+                        )
+                    else:
+                        logger.info("未偵測到可轉換的 PDF 表格 Markdown（略過）")
+                except Exception as e:
+                    logger.warning(f"PDF 表格轉 Markdown 失敗（略過）：{e}")
 
                 # New table pipeline (for schedule-like PDFs):
                 # Primary: pdfplumber direct -> CSV
@@ -897,6 +927,13 @@ class FileService:
                     if not docs_to_store:
                         logger.warning("LlamaParse 無結果，啟動本地快速解析降級流程...")
                         docs_to_store = self._parse_pdf_locally_fast(file_path)
+
+                # Merge markdown-table text chunks into the same upload batch.
+                md_table_docs = self._load_markdown_table_documents(file_path, file.filename)
+                if md_table_docs:
+                    docs_to_store = md_table_docs + (docs_to_store or [])
+                    docs_to_store = self._dedupe_documents(docs_to_store)
+                    logger.info(f"已併入 Markdown 表格文字片段：{len(md_table_docs)} 筆")
 
                 if docs_to_store:
                     docs_to_store = self._attach_upload_session_metadata(
@@ -992,6 +1029,51 @@ class FileService:
             doc.metadata.setdefault("chunk_id", idx)
             doc.metadata.setdefault("type", "general_document")
         return final_splits
+
+    def _load_markdown_table_documents(self, file_path: str, filename: str) -> list[Document]:
+        """
+        Read *_tables.md and convert to vector documents so AI can answer
+        directly from textual markdown table content.
+        """
+        md_path = file_path.rsplit(".", 1)[0] + "_tables.md"
+        if not os.path.exists(md_path):
+            return []
+
+        try:
+            with open(md_path, "r", encoding="utf-8") as f:
+                md_text = f.read().strip()
+            if not md_text:
+                return []
+
+            docs = self._split_markdown_to_documents(md_text, file_path)
+            for i, doc in enumerate(docs):
+                doc.metadata["source"] = file_path
+                doc.metadata["filename"] = filename
+                doc.metadata["type"] = "table_markdown_local"
+                doc.metadata["table_markdown"] = True
+                doc.metadata["md_chunk_id"] = i
+
+                # Try to carry page/table labels when present in chunk text.
+                header_line = (doc.page_content or "").splitlines()[0] if doc.page_content else ""
+                m = re.search(r"Page\s*(\d+)\s*/\s*Table\s*(\d+)", header_line, flags=re.IGNORECASE)
+                if m:
+                    try:
+                        doc.metadata["page"] = int(m.group(1))
+                    except Exception:
+                        pass
+                    try:
+                        doc.metadata["table_index"] = int(m.group(2))
+                    except Exception:
+                        pass
+
+                if not str(doc.page_content).startswith("【表格文字版】"):
+                    doc.page_content = f"【表格文字版】\n{doc.page_content}"
+
+            logger.info(f"📄 已載入 Markdown 表格文本，共 {len(docs)} 個段落: {os.path.basename(md_path)}")
+            return docs
+        except Exception as e:
+            logger.warning(f"載入 Markdown 表格文本失敗: {e}")
+            return []
 
     def _extract_pdf_plain_text_documents(self, file_path: str, filename: str) -> list[Document]:
         """

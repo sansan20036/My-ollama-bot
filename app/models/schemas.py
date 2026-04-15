@@ -28,3 +28,9 @@ class ScheduleDebugRequest(BaseModel):
 class ScheduleSmokeRequest(BaseModel):
     queries: Optional[List[str]] = None
     filename: Optional[str] = None
+
+
+class ScheduleTitleHitsRequest(BaseModel):
+    query: str
+    filename: Optional[str] = None
+    max_samples: int = Field(default=20, ge=1, le=200)

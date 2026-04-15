@@ -3,7 +3,7 @@ import logging
 import os
 import re
 import shutil
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 import httpx
@@ -12,11 +12,17 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Uplo
 from fastapi.responses import FileResponse, StreamingResponse
 
 from app.core.config import settings
-from app.models.schemas import ChatRequest, ScheduleDebugRequest, ScheduleSmokeRequest
+from app.models.schemas import (
+    ChatRequest,
+    ScheduleDebugRequest,
+    ScheduleSmokeRequest,
+    ScheduleTitleHitsRequest,
+)
 from app.services.chat_service import ChatService
 from app.services.file_service import FileService
 from app.services.table_analyzer_service import TableAnalyzerService
 from app.services.vector_store import VectorStoreService
+from app.utils.schedule_utils import extract_days
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -95,14 +101,73 @@ def _pick_target_filename(valid_files: List[str], requested_filename: Optional[s
     return valid_files[-1]
 
 
+def _build_dataframe_from_slot_metadatas(metadatas: List[Dict[str, Any]]) -> pd.DataFrame:
+    """
+    Build a wide schedule DataFrame from schedule_slot metadata.
+    Output columns: 科別, 時間, 星期一..星期日
+    """
+    day_cols = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
+    rows: Dict[tuple, Dict[str, str]] = {}
+
+    for meta in metadatas or []:
+        if not isinstance(meta, dict):
+            continue
+        dept = str(meta.get("department") or meta.get("dept") or "").strip()
+        period = str(meta.get("period") or "").strip() or "未註明"
+        day_raw = str(meta.get("day") or "").strip()
+        doctor = str(meta.get("doctor") or "").strip()
+
+        if not dept or not day_raw or not doctor:
+            continue
+
+        days = extract_days(day_raw)
+        if not days:
+            continue
+        day = days[0]
+        if day not in day_cols:
+            continue
+
+        key = (dept, period)
+        if key not in rows:
+            rows[key] = {"科別": dept, "時間": period}
+            for d in day_cols:
+                rows[key][d] = ""
+
+        current = rows[key].get(day, "")
+        existing = [x for x in str(current).split("、") if x]
+        if doctor not in existing:
+            existing.append(doctor)
+        rows[key][day] = "、".join(existing)
+
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(list(rows.values()))
+
+
 async def _run_schedule_debug(chat_service: ChatService, query: str, requested_filename: Optional[str]) -> dict:
     valid_files = chat_service._get_valid_files()
     target_name = _pick_target_filename(valid_files, requested_filename)
     target_file = os.path.join(UPLOAD_DIR, target_name)
 
     df = _load_dataframe_from_file(chat_service, target_file)
+    source_mode = "file_dataframe"
     if df is None or df.empty:
-        raise HTTPException(status_code=400, detail=f"Target file has no structured table data: {target_name}")
+        # Fallback: rebuild table dataframe from schedule_slot metadatas in vector DB.
+        vs = VectorStoreService.get_instance()
+        slot_data = vs.get_schedule_slot_documents(
+            file_path=target_file,
+            filename=target_name,
+            slot_types=["schedule_slot_local", "schedule_slot"],
+        )
+        metadatas = slot_data.get("metadatas", []) or []
+        df = _build_dataframe_from_slot_metadatas(metadatas)
+        source_mode = "vector_slot_fallback"
+
+    if df is None or df.empty:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Target file has no structured table data: {target_name}",
+        )
 
     constraints = TableAnalyzerService._extract_constraints(query)
     normalized_query = TableAnalyzerService._normalize_query_for_codegen(query)
@@ -123,8 +188,160 @@ async def _run_schedule_debug(chat_service: ChatService, query: str, requested_f
             "surname": constraints.get("surname"),
         },
         "dataframe_shape": [int(df.shape[0]), int(df.shape[1])],
+        "source_mode": source_mode,
         "fallback_row_count": len(fallback_rows),
         "final_result": result_text,
+    }
+
+
+async def _run_schedule_title_hits_debug(
+    chat_service: ChatService,
+    query: str,
+    requested_filename: Optional[str],
+    max_samples: int = 20,
+) -> dict:
+    valid_files = chat_service._get_valid_files()
+    target_name = _pick_target_filename(valid_files, requested_filename)
+    target_file = os.path.join(UPLOAD_DIR, target_name)
+
+    vs = VectorStoreService.get_instance()
+    slot_data = vs.get_schedule_slot_documents(
+        file_path=target_file,
+        filename=target_name,
+        slot_types=["schedule_slot_local", "schedule_slot"],
+        limit=8000,
+    )
+    metadatas = slot_data.get("metadatas", []) or []
+    documents = slot_data.get("documents", []) or []
+    if not metadatas:
+        raise HTTPException(status_code=400, detail=f"No schedule_slot data found: {target_name}")
+
+    constraints = TableAnalyzerService._extract_constraints(query)
+    dept_keyword = TableAnalyzerService._infer_department_keyword(query)
+    special_strategy = TableAnalyzerService.get_special_department_strategy(query)
+    include_days = constraints.get("include_days", set()) or set()
+    exclude_days = constraints.get("exclude_days", set()) or set()
+    include_periods = constraints.get("include_periods", set()) or set()
+    exclude_periods = constraints.get("exclude_periods", set()) or set()
+    surname = constraints.get("surname")
+
+    slot_rows: List[Dict[str, Any]] = []
+    for idx, meta in enumerate(metadatas):
+        if not isinstance(meta, dict):
+            continue
+        content = str(documents[idx] if idx < len(documents) else "")
+        dept = str(meta.get("department") or meta.get("dept") or "").strip()
+        day = str(meta.get("day") or "").strip()
+        period = str(meta.get("period") or "").strip() or "未註明"
+        doctor = str(meta.get("doctor") or "").strip()
+        table_title = str(meta.get("table_title") or "").strip()
+        page = meta.get("page")
+
+        if (not dept or not day or not doctor) and content:
+            parsed = chat_service._parse_slot_sentence(content)
+            if parsed:
+                dept = dept or parsed.get("department", "")
+                day = day or parsed.get("day", "")
+                period = (period if period != "未註明" else "") or parsed.get("period", "未註明")
+                doctor = doctor or parsed.get("doctor", "")
+
+        doctor_list = chat_service._split_slot_doctors(doctor)
+        if not dept or not day or not doctor_list:
+            continue
+        if include_days and day not in include_days:
+            continue
+        if day in exclude_days:
+            continue
+        if include_periods and period not in include_periods:
+            continue
+        if period in exclude_periods:
+            continue
+        if surname:
+            doctor_list = [d for d in doctor_list if d.startswith(surname) or surname in d]
+            if not doctor_list:
+                continue
+
+        slot_rows.append(
+            {
+                "dept": dept,
+                "day": day,
+                "period": period,
+                "doctors": doctor_list,
+                "content": content,
+                "table_title": table_title,
+                "page": page,
+            }
+        )
+
+    def primary_matcher(row: Dict[str, Any]) -> bool:
+        if special_strategy:
+            terms = list(special_strategy.get("primary_terms", []) or [])
+            hay_dept = str(row.get("dept", ""))
+            hay_content = str(row.get("content", ""))
+            hay_title = str(row.get("table_title", ""))
+            hay_doctors = "、".join(row.get("doctors", []) or [])
+            return any(t and (t in hay_dept or t in hay_content or t in hay_title or t in hay_doctors) for t in terms)
+        if dept_keyword:
+            return dept_keyword in str(row.get("dept", ""))
+        return True
+
+    matched_rows = [r for r in slot_rows if primary_matcher(r)]
+    fallback_used = False
+    fallback_department = ""
+    if not matched_rows and special_strategy and special_strategy.get("fallback_department"):
+        fallback_department = str(special_strategy.get("fallback_department") or "").strip()
+        if fallback_department:
+            matched_rows = [r for r in slot_rows if fallback_department in str(r.get("dept", ""))]
+            fallback_used = bool(matched_rows)
+
+    title_counts: Dict[str, int] = {}
+    pages = set()
+    for row in matched_rows:
+        title = str(row.get("table_title") or "").strip() or "(無表題)"
+        title_counts[title] = title_counts.get(title, 0) + 1
+        p = row.get("page")
+        try:
+            if p is not None and str(p).strip() != "":
+                pages.add(int(p))
+        except Exception:
+            pass
+
+    sorted_titles = sorted(title_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    sample_rows = []
+    for row in matched_rows[: max_samples or 20]:
+        sample_rows.append(
+            {
+                "day": row.get("day", ""),
+                "period": row.get("period", ""),
+                "dept": row.get("dept", ""),
+                "table_title": row.get("table_title", ""),
+                "page": row.get("page"),
+                "doctors": row.get("doctors", []),
+            }
+        )
+
+    source_title_count = sum(1 for r in slot_rows if str(r.get("table_title", "")).strip())
+
+    return {
+        "query": query,
+        "target_file": target_name,
+        "source_slot_count": len(slot_rows),
+        "source_with_table_title_count": source_title_count,
+        "matched_count": len(matched_rows),
+        "special_strategy": special_strategy,
+        "dept_keyword": dept_keyword,
+        "fallback_used": fallback_used,
+        "fallback_department": fallback_department,
+        "constraints": {
+            "include_days": sorted(list(include_days)),
+            "exclude_days": sorted(list(exclude_days)),
+            "include_periods": sorted(list(include_periods)),
+            "exclude_periods": sorted(list(exclude_periods)),
+            "surname": surname,
+        },
+        "matched_pages": sorted(list(pages)),
+        "matched_table_titles": [{"title": t, "count": c} for t, c in sorted_titles],
+        "sample_rows": sample_rows,
     }
 
 
@@ -378,5 +595,32 @@ async def debug_schedule_smoke(
         raise
     except Exception as e:
         logger.error(f"Debug schedule smoke error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/debug/schedule-title-hits")
+async def debug_schedule_title_hits(
+    payload: ScheduleTitleHitsRequest,
+    chat_service: ChatService = Depends(get_chat_service_from_app),
+):
+    """
+    Debug endpoint: inspect schedule_slot matches and table_title hits.
+    Useful to verify table caption binding (e.g. 糖尿病足照護特診).
+    """
+    try:
+        q = (payload.query or "").strip()
+        if not q:
+            raise HTTPException(status_code=400, detail="query is required")
+        result = await _run_schedule_title_hits_debug(
+            chat_service=chat_service,
+            query=q,
+            requested_filename=payload.filename,
+            max_samples=payload.max_samples,
+        )
+        return {"status": "ok", "result": result}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Debug schedule title hits error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 

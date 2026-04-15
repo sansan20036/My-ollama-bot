@@ -14,12 +14,20 @@ DEPT_ALIAS_TO_KEYWORD = {
     "胃腸科": "胃腸",
     "胃腸肝膽科": "胃腸",
     "消化內科": "胃腸",
+    "身心科": "精神",
+    "精神科": "精神",
+    "精神部": "精神",
     "骨科": "骨科",
     "心臟科": "心臟",
     "心臟內科": "心臟",
     "神經內科": "神經",
     "兒童心智/青少年保健門診": "心智",
     "兒童心智青少年保健門診": "心智",
+    # 糖尿病足採兩段式：先精準命中糖尿病足，再降級新陳代謝
+    "糖尿病足照護特診": "糖尿病足",
+    "糖尿病足照護特別門診": "糖尿病足",
+    "糖尿病足特診": "糖尿病足",
+    "糖尿病特診": "糖尿病足",
 }
 
 PERIOD_ALIASES = {
@@ -28,10 +36,53 @@ PERIOD_ALIASES = {
     "夜間": ("夜間", "夜診", "晚上", "晚間", "night", "Night", "evening", "Evening"),
 }
 
-NEGATIVE_TOKENS = ("不要", "不看", "排除", "避開", "不要看", "不想要")
+NEGATIVE_TOKENS = ("不要", "不看", "排除", "避開", "不要看", "不想要", "除了", "除外", "絕對不要")
 
 
 class TableAnalyzerService:
+    @staticmethod
+    def get_special_department_strategy(query: str) -> Optional[Dict[str, Any]]:
+        text = str(query or "")
+        if any(k in text for k in ("糖尿病足", "糖足")):
+            return {
+                "label": "糖尿病足特診",
+                "primary_terms": [
+                    "糖尿病足照護特診",
+                    "糖尿病足照護",
+                    "糖尿病足特診",
+                    "糖尿病足",
+                    "糖足",
+                ],
+                "fallback_department": "新陳代謝",
+            }
+        return None
+
+    @staticmethod
+    def looks_like_schedule_query(query: str) -> bool:
+        text = str(query or "")
+        schedule_hints = (
+            "門診", "看診", "醫師", "醫生", "時段", "星期", "週", "周",
+            "上午", "下午", "夜間", "掛號", "姓"
+        )
+        non_schedule_hints = (
+            "防疫小叮嚀", "內容有哪些", "摘要", "注意事項", "規定", "政策", "停車", "接駁"
+        )
+
+        dept = TableAnalyzerService._infer_department_keyword(text)
+        c = TableAnalyzerService._extract_constraints(text)
+        has_constraints = bool(
+            c["include_days"] or c["exclude_days"] or c["include_periods"] or
+            c["exclude_periods"] or c["surname"]
+        )
+        has_schedule_hint = any(k in text for k in schedule_hints)
+        has_non_schedule_hint = any(k in text for k in non_schedule_hints)
+
+        if dept or has_constraints or has_schedule_hint:
+            return True
+        if has_non_schedule_hint:
+            return False
+        return False
+
     @staticmethod
     async def query_and_format_schedule(df: pd.DataFrame, query: str, llm: Any) -> str:
         """
@@ -134,10 +185,41 @@ class TableAnalyzerService:
             if alias in text:
                 return keyword
 
-        # 泛用後綴：xxx科 / xxx門診
-        m = re.search(r"([\u4e00-\u9fa5]{1,12})(?:科|門診)", text)
-        if m:
-            return m.group(1)
+        # 先移除常見時間/語氣詞，避免「星期六骨科」被誤抓成「星期六骨」
+        normalized = (
+            text.replace("禮拜", "星期")
+            .replace("週", "星期")
+            .replace("周", "星期")
+        )
+        normalized = re.sub(
+            r"(今天|明天|後天|大後天|下星期|下下星期|下下下星期|這星期|本星期|星期[一二三四五六日天]|上午|下午|夜間|早上|晚上|哪天|有看診|看診|有哪些|醫師|醫生)",
+            " ",
+            normalized,
+        )
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+
+        # 泛用後綴：xxx科 / xxx門診 / xxx特診 / xxx專診
+        # 使用 finditer 取最有可能的候選，避免前綴殘留干擾。
+        candidates = []
+        for m in re.finditer(r"([\u4e00-\u9fa5A-Za-z/]{1,20})(科|門診|特診|專診)", normalized):
+            head = (m.group(1) or "").strip()
+            suffix = (m.group(2) or "").strip()
+            if not head:
+                continue
+            full = f"{head}{suffix}"
+            candidates.append((head, full))
+
+        if candidates:
+            # 優先用完整詞去 alias map（二次正規化）
+            for head, full in reversed(candidates):
+                for alias, keyword in DEPT_ALIAS_TO_KEYWORD.items():
+                    if alias == full or alias == head:
+                        return keyword
+            # 退而求其次：回傳 head（例如「骨」不合理時會在下層過濾掉）
+            # 優先最長、且靠後出現的候選。
+            candidates.sort(key=lambda x: len(x[0]), reverse=True)
+            return candidates[0][0]
+
         return None
 
     @staticmethod
@@ -159,35 +241,63 @@ class TableAnalyzerService:
     @staticmethod
     def _extract_constraints(query: str) -> Dict[str, Any]:
         text = str(query or "")
+        text_norm = (
+            text.replace("禮拜", "星期")
+            .replace("週", "星期")
+            .replace("周", "星期")
+            .replace("星期天", "星期日")
+            .replace("禮拜天", "星期日")
+        )
         include_days: Set[str] = set()
         exclude_days: Set[str] = set()
         include_periods: Set[str] = set()
         exclude_periods: Set[str] = set()
 
-        # 週末快捷語
-        if "週末" in text or "周末" in text:
+        # 抓「排除片段」：除了/不要/排除...直到標點前
+        negative_spans = []
+        for m in re.finditer(r"(?:除了|除外|不要看|不要|不看|排除|避開|絕對不要)([^。！？；;，,\n]*)", text_norm):
+            seg = (m.group(1) or "").strip()
+            negative_spans.append(m.span())
+
+            if "週末" in seg or "周末" in seg:
+                exclude_days.update({"星期六", "星期日"})
+
+            for canonical, aliases in WEEKDAY_ALIASES.items():
+                if any(alias in seg for alias in aliases):
+                    exclude_days.add(canonical)
+            for canonical, aliases in PERIOD_ALIASES.items():
+                if any(alias.lower() in seg.lower() for alias in aliases):
+                    exclude_periods.add(canonical)
+
+        # 移除排除片段後再抓 include，避免把「除了星期一」誤當 include
+        text_for_include = text_norm
+        for start, end in sorted(negative_spans, reverse=True):
+            text_for_include = text_for_include[:start] + " " + text_for_include[end:]
+
+        # 週末快捷語（include）
+        if "週末" in text_for_include or "周末" in text_for_include:
             include_days.update({"星期六", "星期日"})
 
         # 顯式星期（先全抓，再扣掉排除）
-        include_days.update(extract_days(text))
+        include_days.update(extract_days(text_for_include))
 
         for canonical, aliases in WEEKDAY_ALIASES.items():
             for alias in aliases:
-                if any(re.search(rf"{neg}\s*{re.escape(alias)}", text) for neg in NEGATIVE_TOKENS):
+                if any(re.search(rf"{neg}\s*{re.escape(alias)}", text_norm) for neg in NEGATIVE_TOKENS):
                     exclude_days.add(canonical)
 
         for canonical, aliases in PERIOD_ALIASES.items():
             for alias in aliases:
-                if any(re.search(rf"{neg}\s*{re.escape(alias)}", text, flags=re.IGNORECASE) for neg in NEGATIVE_TOKENS):
+                if any(re.search(rf"{neg}\s*{re.escape(alias)}", text_norm, flags=re.IGNORECASE) for neg in NEGATIVE_TOKENS):
                     exclude_periods.add(canonical)
-                elif re.search(re.escape(alias), text, flags=re.IGNORECASE):
+                elif re.search(re.escape(alias), text_for_include, flags=re.IGNORECASE):
                     include_periods.add(canonical)
 
         include_days -= exclude_days
         include_periods -= exclude_periods
 
         surname = None
-        m = re.search(r"姓\s*[「『'\"`]?\s*([\u4e00-\u9fa5])", text)
+        m = re.search(r"姓\s*[「『'\"`]?\s*([\u4e00-\u9fa5])", text_norm)
         if m:
             surname = m.group(1)
 
@@ -202,18 +312,48 @@ class TableAnalyzerService:
     @staticmethod
     def _split_doctors(raw_items: List[str]) -> List[str]:
         parts: List[str] = []
+        stop_words = {"不指定", "休診", "停診", "未安排", "無門診", "未註明", "上午", "下午", "夜間"}
         for item in raw_items:
             tokens = re.split(r"[、,，;；\s]+", str(item))
             for token in tokens:
                 name = token.strip()
-                if not name or name in {"nan", "None", "-"}:
+                if not name or name in {"nan", "None", "-", "null"}:
                     continue
-                # 過濾誤入的星期字樣
-                if re.search(r"星期[一二三四五六日天]", name):
+                # 去除括號備註、尾隨診間號、星期文字等雜訊
+                name = re.sub(r"\([^)]*\)", "", name)
+                name = re.sub(r"星期[一二三四五六日天]", "", name)
+                name = re.sub(r"\d{2,4}$", "", name)
+                # 只保留中文姓名常見字元
+                name = re.sub(r"[^\u4e00-\u9fa5．·]", "", name).strip()
+                if not name:
+                    continue
+                if name in stop_words:
+                    continue
+                if len(name) < 2:
                     continue
                 parts.append(name)
         # 保留順序去重
         return list(dict.fromkeys(parts))
+
+    @staticmethod
+    def _detect_periods(text: str) -> List[str]:
+        raw = str(text or "")
+        if not raw:
+            return []
+
+        periods: List[str] = []
+        for canonical, aliases in PERIOD_ALIASES.items():
+            if any(alias.lower() in raw.lower() for alias in aliases):
+                periods.append(canonical)
+        if "全天" in raw or "全日" in raw:
+            periods.extend(["上午", "下午"])
+
+        # 去重保序
+        deduped: List[str] = []
+        for p in periods:
+            if p not in deduped:
+                deduped.append(p)
+        return deduped
 
     @staticmethod
     def _format_dict_rows(rows: List[Dict[str, Any]], query: str) -> str:
@@ -267,40 +407,70 @@ class TableAnalyzerService:
         exclude_periods = c["exclude_periods"]
         surname = c["surname"]
 
+        # 逐列解析，避免 time_col 判斷失敗導致整天都無門診
+        day_period_names: Dict[str, Dict[str, List[str]]] = {}
+        for _, row in clean_df.iterrows():
+            row_text = " ".join([str(v) for v in row.values if str(v).strip()])
+            periods = []
+            if time_col:
+                periods = TableAnalyzerService._detect_periods(str(row.get(time_col, "")))
+            if not periods:
+                periods = TableAnalyzerService._detect_periods(row_text)
+            if not periods:
+                periods = ["未註明"]
+
+            # 套用時段 include/exclude 條件
+            filtered_periods = []
+            for p in periods:
+                if include_periods and p not in include_periods:
+                    continue
+                if p in exclude_periods:
+                    continue
+                filtered_periods.append(p)
+            if not filtered_periods:
+                continue
+
+            for day in days_of_week:
+                if include_days and day not in include_days:
+                    continue
+                if day in exclude_days:
+                    continue
+
+                day_col = day_column_map.get(day)
+                if not day_col:
+                    continue
+
+                names = TableAnalyzerService._split_doctors([str(row.get(day_col, ""))])
+                if surname:
+                    names = [n for n in names if n.startswith(surname) or surname in n]
+                if not names:
+                    continue
+
+                day_period_names.setdefault(day, {})
+                for p in filtered_periods:
+                    existing = day_period_names[day].setdefault(p, [])
+                    for n in names:
+                        if n not in existing:
+                            existing.append(n)
+
         structured_text = ""
         for day in days_of_week:
             if include_days and day not in include_days:
                 continue
             if day in exclude_days:
                 continue
-
-            day_col = day_column_map.get(day)
-            if not day_col:
+            if day not in day_period_names or not day_period_names[day]:
+                structured_text += f"【{day}】\n - 無門診\n\n"
                 continue
 
             structured_text += f"【{day}】\n"
-            day_has_data = False
-
-            if time_col:
-                for period in DEFAULT_PERIODS:
-                    if include_periods and period not in include_periods:
-                        continue
-                    if period in exclude_periods:
-                        continue
-
-                    mask = clean_df[time_col].astype(str).str.contains(period, na=False)
-                    doctors = clean_df.loc[mask, day_col].tolist()
-                    names = TableAnalyzerService._split_doctors(doctors)
-
-                    if surname:
-                        names = [n for n in names if n.startswith(surname) or surname in n]
-
-                    if names:
-                        structured_text += f" - {period}：{'、'.join(names)}\n"
-                        day_has_data = True
-
-            if not day_has_data:
-                structured_text += " - 無門診\n"
+            # 優先顯示常見時段，其他時段放最後
+            ordered_periods = [p for p in DEFAULT_PERIODS if p in day_period_names[day]]
+            ordered_periods += [p for p in day_period_names[day].keys() if p not in ordered_periods]
+            for p in ordered_periods:
+                names = day_period_names[day].get(p, [])
+                if names:
+                    structured_text += f" - {p}：{'、'.join(names)}\n"
             structured_text += "\n"
 
         if structured_text.strip():

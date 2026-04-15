@@ -20,11 +20,12 @@ from abc import ABC, abstractmethod
 from fastapi import UploadFile
 from langchain_community.document_loaders import Docx2txtLoader, TextLoader
 import re
-from typing import Optional
+from typing import Optional, Any
 from dotenv import load_dotenv
 from app.core.config import settings
 from app.services.vector_store import VectorStoreService
 from app.utils.smart_parser import SmartFileParser
+from app.utils.schedule_utils import clean_doctor_name
 
 # 設定 Log
 logger = logging.getLogger(__name__)
@@ -87,6 +88,255 @@ def _is_table_row(line: str, min_cols: int = 2) -> bool:
     if not s or "|" not in s or s.startswith("```"):
         return False
     return len(_split_md_row(s)) >= min_cols
+
+
+def _normalize_table_matrix(table: list[list[Any]]) -> list[list[str]]:
+    """Normalize pdf table matrix to same-width string rows."""
+    rows: list[list[str]] = []
+    max_width = 0
+    for raw_row in table or []:
+        if raw_row is None:
+            continue
+        row = [_sanitize_cell_text(cell) for cell in raw_row]
+        if any(row):
+            rows.append(row)
+            max_width = max(max_width, len(row))
+
+    if not rows or max_width < 2:
+        return []
+
+    normalized = []
+    for row in rows:
+        if len(row) < max_width:
+            row = row + [""] * (max_width - len(row))
+        elif len(row) > max_width:
+            row = row[:max_width]
+        normalized.append(row)
+    return normalized
+
+
+def _table_to_markdown(table_rows: list[list[str]], page_idx: int, table_idx: int) -> str:
+    """Convert normalized table rows to markdown table text."""
+    if not table_rows or len(table_rows) < 2:
+        return ""
+
+    headers = [h if h else f"欄位_{i + 1}" for i, h in enumerate(table_rows[0])]
+    body_rows = table_rows[1:]
+    if not body_rows:
+        return ""
+
+    md_lines = [f"### 表格 Page {page_idx} / Table {table_idx}"]
+    md_lines.append("| " + " | ".join(headers) + " |")
+    md_lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
+    for row in body_rows:
+        md_lines.append("| " + " | ".join(row) + " |")
+    return "\n".join(md_lines)
+
+
+def extract_pdf_tables_to_markdown(pdf_path: str) -> tuple[str, int]:
+    """
+    Extract PDF tables and convert them into markdown text.
+    Returns (markdown_text, table_count).
+    """
+    blocks: list[str] = []
+    table_count = 0
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            for page_idx, page in enumerate(pdf.pages, start=1):
+                tables = page.extract_tables() or []
+                local_idx = 0
+                for table in tables:
+                    normalized = _normalize_table_matrix(table)
+                    if not normalized:
+                        continue
+                    local_idx += 1
+                    md = _table_to_markdown(normalized, page_idx, local_idx)
+                    if md:
+                        blocks.append(md)
+                        table_count += 1
+    except Exception as e:
+        logger.warning(f"PDF 轉 Markdown 表格失敗: {e}")
+        return "", 0
+
+    return "\n\n".join(blocks), table_count
+
+
+def markdown_tables_to_csv(markdown_text: str, csv_path: str) -> bool:
+    """
+    Parse markdown tables into one CSV.
+    Keeps columns aligned by header names and concatenates all tables.
+    """
+    lines = (markdown_text or "").splitlines()
+    all_frames: list[pd.DataFrame] = []
+    i = 0
+
+    while i < len(lines):
+        line = lines[i].strip()
+        if i + 1 < len(lines) and _is_table_row(line, min_cols=2) and _is_separator(lines[i + 1]):
+            header = _split_md_row(line)
+            i += 2
+            rows: list[list[str]] = []
+            while i < len(lines):
+                row_line = lines[i].strip()
+                if not _is_table_row(row_line, min_cols=max(2, len(header) - 1)):
+                    break
+                row = _split_md_row(row_line)
+                if len(row) < len(header):
+                    row += [""] * (len(header) - len(row))
+                elif len(row) > len(header):
+                    row = row[:len(header)]
+                rows.append(row)
+                i += 1
+
+            if rows and header:
+                df = pd.DataFrame(rows, columns=header)
+                all_frames.append(df)
+            continue
+        i += 1
+
+    if not all_frames:
+        return False
+
+    final_df = pd.concat(all_frames, ignore_index=True)
+    final_df.replace(r"\s+", " ", regex=True, inplace=True)
+    final_df.replace("", np.nan, inplace=True)
+    final_df.dropna(how="all", inplace=True)
+    final_df.fillna("", inplace=True)
+    final_df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+    return True
+
+
+def extract_markdown_tables_and_save_csv(pdf_path: str) -> bool:
+    """
+    New pipeline:
+    PDF tables -> Markdown -> CSV (_tables.csv).
+    """
+    csv_path = pdf_path.rsplit(".", 1)[0] + "_tables.csv"
+    md_text, table_count = extract_pdf_tables_to_markdown(pdf_path)
+    if table_count <= 0 or not md_text.strip():
+        logger.info("Markdown 表格管線：未偵測到可轉換表格")
+        return False
+
+    ok = markdown_tables_to_csv(md_text, csv_path)
+    if ok:
+        logger.info(f"Markdown 表格管線完成：{table_count} 張表格 -> {os.path.basename(csv_path)}")
+    else:
+        logger.info("Markdown 表格管線：解析為 CSV 失敗，無有效資料")
+    return ok
+
+
+def extract_schedule_tables_with_hybrid_pipeline(pdf_path: str) -> tuple[bool, str]:
+    """
+    Hybrid pipeline for schedule-like PDFs:
+    1) Primary: direct table extraction -> CSV (extract_and_save_tables)
+    2) Fallback: PDF tables -> Markdown -> CSV
+    """
+    try:
+        if extract_and_save_tables(pdf_path):
+            return True, "pdfplumber_direct"
+    except Exception as e:
+        logger.warning(f"Primary PDF 表格直抽失敗，改走 Markdown fallback: {e}")
+
+    try:
+        if extract_markdown_tables_and_save_csv(pdf_path):
+            return True, "markdown_fallback"
+    except Exception as e:
+        logger.warning(f"Markdown fallback 也失敗: {e}")
+
+    return False, "none"
+
+
+def _is_probable_table_header_text(text: str) -> bool:
+    t = _sanitize_cell_text(text).lower()
+    if not t:
+        return False
+    if re.search(r"(department|doctor|period|session|weekday|mon|tue|wed|thu|fri|sat|sun)", t, re.IGNORECASE):
+        return True
+    if re.search(r"(科別|時段|醫師|星期[一二三四五六日天]|週[一二三四五六日]|周[一二三四五六日])", t):
+        return True
+    return False
+
+
+def _extract_table_caption(page: pdfplumber.page.Page, bbox: Any) -> str:
+    """
+    Try to bind nearby table caption/title text above table bbox.
+    This fixes the common "title detachment" issue in PDF table extraction.
+    """
+    if not bbox:
+        return ""
+
+    try:
+        x0, top, x1, _ = bbox
+        probe_h = 200
+        top_y = max(0, float(top) - probe_h)
+        title_box = (
+            max(0, float(x0) - 20),
+            top_y,
+            min(float(page.width), float(x1) + 20),
+            max(top_y + 1, float(top) - 2),
+        )
+        text = (page.crop(title_box).extract_text() or "").strip()
+        if not text:
+            # fallback to full-width strip above table
+            fallback_box = (0, top_y, float(page.width), max(top_y + 1, float(top) - 2))
+            text = (page.crop(fallback_box).extract_text() or "").strip()
+
+        if not text:
+            # fallback #2: line reconstruction by word coordinates (robust against broken line extraction)
+            words = page.extract_words() or []
+            margin_x = 30
+            upper_words = [
+                w for w in words
+                if (float(w.get("bottom", 0)) <= float(top))
+                and (float(w.get("top", 0)) >= max(0, float(top) - probe_h))
+                and (float(w.get("x1", 0)) >= float(x0) - margin_x)
+                and (float(w.get("x0", 0)) <= float(x1) + margin_x)
+            ]
+            if upper_words:
+                upper_words.sort(key=lambda w: (round(float(w.get("top", 0)), 1), float(w.get("x0", 0))))
+                line_buckets: list[list[str]] = []
+                line_top = None
+                for w in upper_words:
+                    wt = _sanitize_cell_text(w.get("text", ""))
+                    if not wt:
+                        continue
+                    t = float(w.get("top", 0))
+                    if line_top is None or abs(t - line_top) <= 3.5:
+                        if not line_buckets:
+                            line_buckets.append([])
+                        line_buckets[-1].append(wt)
+                        if line_top is None:
+                            line_top = t
+                    else:
+                        line_buckets.append([wt])
+                        line_top = t
+                text = "\n".join("".join(parts) for parts in line_buckets if parts)
+
+        if not text:
+            return ""
+
+        raw_lines = [_sanitize_cell_text(line).replace(" ", "") for line in text.splitlines()]
+        lines = [ln for ln in raw_lines if ln and not _is_probable_table_header_text(ln)]
+        if not lines:
+            return ""
+
+        # If caption is split into 2 short lines (e.g., "糖尿病足照護" + "特診"), join them.
+        last = lines[-1]
+        if len(lines) >= 2:
+            prev = lines[-2]
+            if len(last) <= 16 and len(prev) <= 28:
+                merged = f"{prev}{last}"
+                if 2 <= len(merged) <= 60:
+                    return merged
+
+        # otherwise use the last reasonable line
+        for cand in reversed(lines[-8:]):
+            if 2 <= len(cand) <= 80:
+                return cand
+    except Exception as e:
+        logger.debug(f"extract table caption failed: {e}")
+
+    return ""
 
 
 def _normalize_day_header(header: str) -> str:
@@ -623,6 +873,21 @@ class FileService:
             elif file_path.lower().endswith(".pdf"):
                 parse_mode = self._resolve_pdf_parse_mode(file_path)
                 logger.info(f"PDF 解析模式: {parse_mode}")
+                is_schedule_pdf = self._is_likely_medical_schedule_pdf(file_path)
+
+                # New table pipeline (for schedule-like PDFs):
+                # Primary: pdfplumber direct -> CSV
+                # Fallback: PDF tables -> Markdown -> CSV
+                # so downstream pandas logic can read _tables.csv.
+                if is_schedule_pdf:
+                    try:
+                        ok, mode_used = extract_schedule_tables_with_hybrid_pipeline(file_path)
+                        if ok:
+                            logger.info(f"📊 表格混合管線成功，模式: {mode_used}")
+                        else:
+                            logger.info("📊 表格混合管線未產生 CSV，將依賴後續 slot/文本索引流程")
+                    except Exception as e:
+                        logger.warning(f"表格混合管線失敗，略過並繼續原流程: {e}")
 
                 if parse_mode == "local_fast":
                     docs_to_store = self._parse_pdf_locally_fast(file_path)
@@ -871,7 +1136,7 @@ class FileService:
             dedup = []
             seen = set()
             for n in direct_name_hits:
-                n = n.strip()
+                n = clean_doctor_name(n)
                 if not n or n in seen:
                     continue
                 seen.add(n)
@@ -891,10 +1156,8 @@ class FileService:
         results = []
         seen = set()
         for part in parts:
-            # 去掉尾端診間號數字與日期註記
-            cleaned = re.sub(r"\(.*?\)", "", part).strip()
-            cleaned = re.sub(r"\d{3,5}$", "", cleaned).strip()
-            cleaned = cleaned.replace(" ", "")
+            # 去掉尾端診間號、日期註記等噪音
+            cleaned = clean_doctor_name(part)
             if not cleaned:
                 continue
             if cleaned in seen:
@@ -1079,8 +1342,24 @@ class FileService:
         try:
             with pdfplumber.open(file_path) as pdf:
                 for page_idx, page in enumerate(pdf.pages, start=1):
-                    tables = page.extract_tables() or []
-                    for table in tables:
+                    table_entries: list[tuple[list[list[Any]], Any, int]] = []
+                    try:
+                        found_tables = page.find_tables() or []
+                        for t_idx, t_obj in enumerate(found_tables, start=1):
+                            extracted = t_obj.extract() if t_obj else None
+                            if extracted:
+                                table_entries.append((extracted, getattr(t_obj, "bbox", None), t_idx))
+                    except Exception as e:
+                        logger.debug(f"find_tables failed on page {page_idx}: {e}")
+
+                    if not table_entries:
+                        raw_tables = page.extract_tables() or []
+                        for t_idx, table in enumerate(raw_tables, start=1):
+                            if table:
+                                table_entries.append((table, None, t_idx))
+
+                    for table, table_bbox, table_idx in table_entries:
+                        table_title = _extract_table_caption(page, table_bbox)
                         rows = []
                         for row in table:
                             if not row:
@@ -1230,18 +1509,26 @@ class FileService:
                                     sentence = (
                                         f"【門診時段查詢】科別：「{dept}」；時段：「{period}」；{day}醫師：「{doctor}」。"
                                     )
-                                    if sentence in sentence_seen:
+                                    dedupe_key = sentence if not table_title else f"{sentence}|{table_title}"
+                                    if dedupe_key in sentence_seen:
                                         continue
-                                    sentence_seen.add(sentence)
+                                    sentence_seen.add(dedupe_key)
+                                    page_content = sentence
+                                    if table_title:
+                                        page_content = f"{sentence}（表題：{table_title}）"
+                                    metadata = {
+                                        "source": file_path,
+                                        "filename": filename,
+                                        "page": page_idx,
+                                        "type": "schedule_slot_local",
+                                        "table_index": table_idx,
+                                    }
+                                    if table_title:
+                                        metadata["table_title"] = table_title
                                     docs.append(
                                         Document(
-                                            page_content=sentence,
-                                            metadata={
-                                                "source": file_path,
-                                                "filename": filename,
-                                                "page": page_idx,
-                                                "type": "schedule_slot_local",
-                                            },
+                                            page_content=page_content,
+                                            metadata=metadata,
                                         )
                                     )
 

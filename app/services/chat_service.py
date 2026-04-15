@@ -614,7 +614,20 @@ class ChatService:
                             return True
                     return False
                 if dept_keyword:
-                    return dept_keyword in str(row.get("dept", ""))
+                    hay_dept = str(row.get("dept", ""))
+                    hay_content = str(row.get("content", ""))
+                    hay_title = str(row.get("table_title", ""))
+                    hay_doctors = "、".join(row.get("doctors", []) or [])
+                    hay_raw = f"{hay_dept} {hay_content} {hay_title} {hay_doctors}"
+                    hay_norm = re.sub(r"[^\w\u4e00-\u9fff]", "", hay_raw).lower()
+                    key_norm = re.sub(r"[^\w\u4e00-\u9fff]", "", str(dept_keyword)).lower()
+                    return (
+                        dept_keyword in hay_dept
+                        or dept_keyword in hay_content
+                        or dept_keyword in hay_title
+                        or dept_keyword in hay_doctors
+                        or (key_norm and key_norm in hay_norm)
+                    )
                 return True
 
             def summarize_rows(rows: List[Dict[str, Any]], limit: int = 5) -> List[Dict[str, Any]]:

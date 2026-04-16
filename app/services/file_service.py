@@ -354,6 +354,55 @@ def _extract_table_caption(page: pdfplumber.page.Page, bbox: Any) -> str:
     return ""
 
 
+def _infer_branch_scope_label(page: pdfplumber.page.Page, table_title: str = "") -> str:
+    """
+    Infer schedule scope (e.g., 嘉義暨灣橋分院支援門診) from table title + page top banner.
+    """
+    probes = [str(table_title or "")]
+    try:
+        top_h = min(float(page.height), 260.0)
+        top_text = (page.crop((0, 0, float(page.width), top_h)).extract_text() or "").strip()
+        if top_text:
+            probes.append(top_text)
+    except Exception:
+        pass
+
+    hay = re.sub(r"\s+", "", " ".join([p for p in probes if p])).lower()
+    if not hay:
+        return ""
+
+    # 台中榮總醫師支援嘉義暨灣橋分院門診時間
+    if (
+        (("嘉義" in hay and "灣橋" in hay) and ("分院" in hay or "支援" in hay))
+        or ("chiayi" in hay and "wanqiao" in hay)
+    ):
+        return "chiayi_wanqiao_support"
+
+    # 台中榮總醫師支援埔里分院門診時間
+    if (("埔里" in hay and "分院" in hay) or ("puli" in hay and "branch" in hay)):
+        return "puli_support"
+
+    return ""
+
+
+def _branch_scope_prefix(scope_key: str) -> str:
+    key = str(scope_key or "").strip()
+    if key == "chiayi_wanqiao_support":
+        return "嘉義暨灣橋分院-"
+    if key == "puli_support":
+        return "埔里分院-"
+    return ""
+
+
+def _branch_scope_label(scope_key: str) -> str:
+    key = str(scope_key or "").strip()
+    if key == "chiayi_wanqiao_support":
+        return "嘉義暨灣橋分院支援門診"
+    if key == "puli_support":
+        return "埔里分院支援門診"
+    return ""
+
+
 def _normalize_day_header(header: str) -> str:
     raw = _sanitize_cell_text(header)
     if not raw:
@@ -1116,6 +1165,58 @@ class FileService:
             logger.warning(f"PDF 純文字萃取失敗，略過純文字索引: {e}")
         return docs
 
+    def _extract_pdf_page_raw_documents(self, file_path: str, filename: str) -> list[Document]:
+        """
+        Parent layer: keep one full-text document per PDF page.
+        This is used for parent-child retrieval expansion after child hits.
+        """
+        docs: list[Document] = []
+        try:
+            ocr = RapidOCR()
+            with fitz.open(file_path) as pdf:
+                for page_idx, page in enumerate(pdf, start=1):
+                    page_text = (page.get_text("text") or "").strip()
+                    compact = re.sub(r"\s+", "", page_text)
+                    needs_ocr = (len(compact) < 30) or ("cid:" in page_text) or ("MNOP" in page_text)
+
+                    if needs_ocr:
+                        try:
+                            pix = page.get_pixmap(dpi=150)
+                            img_array = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
+                            if pix.n == 4:
+                                img_array = cv2.cvtColor(img_array, cv2.COLOR_BGRA2BGR)
+                            elif pix.n == 3:
+                                img_array = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+
+                            result, _ = ocr(img_array)
+                            if result:
+                                ocr_text = "\n".join([line[1] for line in result if len(line) > 1])
+                                if ocr_text.strip():
+                                    page_text = ocr_text.strip()
+                        except Exception as ocr_e:
+                            logger.debug(f"page_raw OCR fallback failed on page {page_idx}: {ocr_e}")
+
+                    page_text = (page_text or "").strip()
+                    if not page_text:
+                        page_text = "[本頁無可辨識文字]"
+
+                    docs.append(
+                        Document(
+                            page_content=f"【PDF整頁全文 Page {page_idx}】\n{page_text}",
+                            metadata={
+                                "source": file_path,
+                                "filename": filename,
+                                "page": page_idx,
+                                "type": "page_raw_local",
+                                "parent_layer": True,
+                            },
+                        )
+                    )
+            logger.info(f"📚 PDF 整頁全文層建立完成，共 {len(docs)} 頁")
+        except Exception as e:
+            logger.warning(f"PDF 整頁全文層建立失敗，略過 parent layer: {e}")
+        return docs
+
     def _dedupe_documents(self, docs: list[Document]) -> list[Document]:
         """
         以 type + page + content 去重，降低多路解析造成的重複 chunk。
@@ -1442,6 +1543,9 @@ class FileService:
 
                     for table, table_bbox, table_idx in table_entries:
                         table_title = _extract_table_caption(page, table_bbox)
+                        scope_key = _infer_branch_scope_label(page, table_title)
+                        scope_prefix = _branch_scope_prefix(scope_key)
+                        scope_label = _branch_scope_label(scope_key)
                         rows = []
                         for row in table:
                             if not row:
@@ -1565,6 +1669,8 @@ class FileService:
                                 dept = last_dept
                             if not dept:
                                 continue
+                            if scope_prefix and not str(dept).startswith(scope_prefix):
+                                dept = f"{scope_prefix}{dept}"
 
                             period = ""
                             for col_idx in time_cols:
@@ -1598,6 +1704,8 @@ class FileService:
                                     page_content = sentence
                                     if table_title:
                                         page_content = f"{sentence}（表題：{table_title}）"
+                                    if scope_label:
+                                        page_content = f"{page_content}（院區：{scope_label}）"
                                     metadata = {
                                         "source": file_path,
                                         "filename": filename,
@@ -1607,6 +1715,10 @@ class FileService:
                                     }
                                     if table_title:
                                         metadata["table_title"] = table_title
+                                    if scope_key:
+                                        metadata["scope_key"] = scope_key
+                                    if scope_label:
+                                        metadata["scope_label"] = scope_label
                                     docs.append(
                                         Document(
                                             page_content=page_content,
@@ -1642,15 +1754,16 @@ class FileService:
             parser = SmartFileParser()
             docs = parser.parse(text_content, filename)
             plain_text_docs = self._extract_pdf_plain_text_documents(file_path, filename)
+            page_raw_docs = self._extract_pdf_page_raw_documents(file_path, filename)
             schedule_docs = []
             if is_schedule_pdf:
                 schedule_docs = self._extract_schedule_docs_from_pdf_tables(file_path, filename)
                 # 只有門診文件才注入結構化 slot，避免污染一般知識文件。
 
             if is_schedule_pdf:
-                docs = schedule_docs + plain_text_docs + docs
+                docs = schedule_docs + plain_text_docs + page_raw_docs + docs
             else:
-                docs = plain_text_docs + docs
+                docs = plain_text_docs + page_raw_docs + docs
 
             docs = self._dedupe_documents(docs)
 
@@ -1689,6 +1802,7 @@ class FileService:
             final_splits = self._split_markdown_to_documents(full_markdown, file_path)
             filename = os.path.basename(file_path)
             plain_text_docs = self._extract_pdf_plain_text_documents(file_path, filename)
+            page_raw_docs = self._extract_pdf_page_raw_documents(file_path, filename)
             schedule_docs = []
 
             if is_schedule_pdf:
@@ -1699,9 +1813,9 @@ class FileService:
                 f"📄 LlamaParse 解析完成: {'門診文件' if is_schedule_pdf else '一般文件'}，共 {len(final_splits)} 筆"
             )
             if is_schedule_pdf:
-                final_splits = schedule_docs + plain_text_docs + final_splits
+                final_splits = schedule_docs + plain_text_docs + page_raw_docs + final_splits
             else:
-                final_splits = plain_text_docs + final_splits
+                final_splits = plain_text_docs + page_raw_docs + final_splits
             final_splits = self._dedupe_documents(final_splits)
             logger.info(
                 f"📄 LlamaParse 解析完成，共 {len(final_splits)} 筆（結構化門診 {len(schedule_docs)} 筆，純文字 {len(plain_text_docs)} 筆）"

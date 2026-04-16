@@ -12,6 +12,7 @@ from langchain_ollama import ChatOllama
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
+from langchain_core.documents import Document
 from pydantic import BaseModel, Field
 # 新增：引入建構多模態訊息所需的套件
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -124,11 +125,12 @@ class ChatService:
             str(getattr(settings, "SCHEDULE_OVERRIDES_FILE", "") or "").strip()
         )
 
-        # 新增防呆：過濾掉結尾是 _tables.csv 的系統快取檔，只計算使用者真正上傳的檔案！
+        # 新增防呆：過濾掉系統快取檔（_tables.csv/_tables.md），只計算使用者真正上傳的檔案！
         files = [f for f in os.listdir(self.upload_dir) if
                  os.path.isfile(os.path.join(self.upload_dir, f))
                  and not f.startswith("~")
                  and not f.endswith("_tables.csv")
+                 and not f.endswith("_tables.md")
                  and (not overrides_basename or f != overrides_basename)]
 
         # 依照檔案的「最後修改/建立時間」進行排序 (由舊到新)
@@ -390,6 +392,527 @@ class ChatService:
         return terms[:24]
 
     @staticmethod
+    def _is_doctor_profile_query(query: str) -> bool:
+        text = str(query or "")
+        profile_keywords = ("專長", "擅長", "專科", "專業", "學經歷", "主治", "主治項目")
+        dept_question_keywords = ("什麼科", "哪一科", "哪科", "科別", "屬於哪科", "看哪科")
+
+        # 明確問醫師/醫生資訊
+        if ("醫師" in text or "醫生" in text) and (
+                any(k in text for k in profile_keywords) or any(k in text for k in dept_question_keywords)
+        ):
+            return True
+
+        # 支援省略「醫師」字樣：如「蔡嘉一專長是什麼科」「楊曜綸是什麼科」
+        doctor_name = ChatService._extract_doctor_name_from_query(text)
+        if doctor_name and (
+                any(k in text for k in profile_keywords) or any(k in text for k in dept_question_keywords)
+        ):
+            return True
+
+        return False
+
+    @staticmethod
+    def _is_branch_support_query(query: str) -> bool:
+        text = str(query or "")
+        has_branch = any(k in text for k in ("嘉義", "灣橋"))
+        has_scope = any(k in text for k in ("分院", "支援", "院區"))
+        return has_branch and has_scope
+
+    @staticmethod
+    def _is_textual_rag_force_query(query: str) -> bool:
+        text = str(query or "")
+        if not text:
+            return False
+
+        if any(k in text for k in ("逐頁", "頁碼")):
+            return True
+        if "頁" in text and any(k in text for k in ("備註", "注意事項", "內容", "說明", "規定")):
+            return True
+        if any(k in text for k in ("備註", "注意事項", "註記")) and not any(
+                k in text for k in ("星期", "上午", "下午", "夜間", "下週", "下下週")
+        ):
+            return True
+
+        return False
+
+    def _build_lexical_target_filenames(self, valid_files: list, query: str) -> List[str]:
+        """
+        Build robust lexical-search targets.
+        - Default: latest uploaded file.
+        - Doctor profile query: broaden to all uploaded files in the same batch.
+        - Defensive fallback: if latest is *_tables.md, try original PDF too.
+        """
+        if not valid_files:
+            return []
+
+        targets: List[str] = []
+        latest = str(valid_files[-1] or "").strip()
+        if latest:
+            targets.append(latest)
+
+        if latest.endswith("_tables.md"):
+            original_pdf = latest.replace("_tables.md", ".pdf")
+            if original_pdf and original_pdf not in targets:
+                targets.append(original_pdf)
+
+        if self._is_doctor_profile_query(query):
+            for f in valid_files:
+                ff = str(f or "").strip()
+                if ff and ff not in targets:
+                    targets.append(ff)
+
+        return targets
+
+    @staticmethod
+    def _normalize_schedule_department_keyword(query: str, dept_keyword: str) -> str:
+        text = str(query or "")
+        current = str(dept_keyword or "").strip()
+        if not text or not current:
+            return current
+
+        noisy_terms = ("支援", "分院", "醫院", "門診時間", "時間")
+        needs_repair = len(current) > 10 or any(t in current for t in noisy_terms)
+        if not needs_repair:
+            return current
+
+        normalized = (
+            text.replace("禮拜", "星期")
+            .replace("週", "星期")
+            .replace("周", "星期")
+        )
+        normalized = re.sub(
+            r"(今天|明天|後天|大後天|下星期|下下星期|下下下星期|這星期|本星期|"
+            r"星期[一二三四五六日天]|上午|下午|夜間|早上|晚上|哪天|有看診|看診|有哪些|"
+            r"醫師|醫生|門診時間|門診時刻|門診時間表|門診表)",
+            " ",
+            normalized,
+        )
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+
+        short_candidates = re.findall(r"([\u4e00-\u9fa5A-Za-z/]{1,10}(?:科|門診|特診|專診))", normalized)
+        for full in reversed(short_candidates):
+            full = str(full or "").strip()
+            if not full:
+                continue
+            if any(t in full for t in noisy_terms):
+                continue
+            return full
+
+        return current
+
+    @staticmethod
+    def _extract_doctor_name_from_query(query: str) -> str:
+        text = str(query or "")
+        patterns = [
+            r"([\u4e00-\u9fa5]{2,4})醫師",
+            r"醫師[\s：:]*([\u4e00-\u9fa5]{2,4})",
+            r"([\u4e00-\u9fa5]{2,4})(?:的)?(?:專長|擅長|主治|學經歷|次專科)",
+            r"([\u4e00-\u9fa5]{2,4})\s*(?:是|屬於)?\s*(?:什麼科|哪一科|哪科|科別|看哪科)",
+        ]
+        invalid_fragments = ("科", "門診", "星期", "週", "周", "今天", "明天", "後天", "下週", "下星期")
+        for p in patterns:
+            m = re.search(p, text)
+            if m:
+                candidate = str(m.group(1) or "").strip()
+                candidate = re.sub(r"(是|屬於|的)$", "", candidate).strip()
+                if not candidate:
+                    continue
+                if any(frag in candidate for frag in invalid_fragments):
+                    continue
+                return candidate
+        return ""
+
+    @staticmethod
+    def _make_snippet(text: str, terms: List[str], radius: int = 42, hard_limit: int = 120) -> str:
+        clean = re.sub(r"\s+", " ", str(text or "")).strip()
+        if not clean:
+            return ""
+        idx = -1
+        hit_term = ""
+        for t in terms:
+            if not t:
+                continue
+            i = clean.find(t)
+            if i >= 0:
+                idx = i
+                hit_term = t
+                break
+        if idx < 0:
+            return clean[:hard_limit] + ("..." if len(clean) > hard_limit else "")
+        start = max(0, idx - radius)
+        end = min(len(clean), idx + len(hit_term) + radius)
+        snippet = clean[start:end]
+        if start > 0:
+            snippet = "..." + snippet
+        if end < len(clean):
+            snippet = snippet + "..."
+        return snippet[:hard_limit]
+
+    @staticmethod
+    def _extract_specialty_from_snippet(snippet: str, doctor_name: str) -> str:
+        text = re.sub(r"\s+", " ", str(snippet or "")).strip()
+        name = str(doctor_name or "").strip()
+        if not text or not name:
+            return ""
+
+        m = re.search(rf"{re.escape(name)}\s*[-－—:：]\s*(.+)$", text)
+        if not m:
+            return ""
+
+        specialty = str(m.group(1) or "").strip(" .。；;")
+        if not specialty:
+            return ""
+        return specialty
+
+    @classmethod
+    def _is_strict_profile_snippet(cls, snippet: str, doctor_name: str) -> bool:
+        specialty = cls._extract_specialty_from_snippet(snippet, doctor_name)
+        if not specialty:
+            return False
+
+        noisy_patterns = (
+            r"星期[一二三四五六日]",
+            r"上午|下午|夜間|未註明|門診",
+            r"\d{3,4}",
+            r"醫療一樓|第\s*[一二三四五六七八九十]+\s*醫療",
+        )
+        for pattern in noisy_patterns:
+            if re.search(pattern, specialty):
+                return False
+        return True
+
+    def _collect_profile_audit_evidence(self, docs: List[Any], query: str, max_items: int = 3) -> List[Dict[str, Any]]:
+        doctor_name = self._extract_doctor_name_from_query(query)
+        profile_terms = ["專長", "擅長", "主治", "學經歷", "次專科"]
+        evidence_terms = ([doctor_name] if doctor_name else []) + profile_terms
+
+        evidences: List[Dict[str, Any]] = []
+        seen = set()
+        inferred_page_cache: Dict[str, Optional[int]] = {}
+
+        def _resolve_page_with_fallback(source_name: str, doctor: str) -> Optional[int]:
+            cache_key = f"{source_name}|{doctor}"
+            if cache_key in inferred_page_cache:
+                return inferred_page_cache[cache_key]
+            if not source_name or not doctor:
+                inferred_page_cache[cache_key] = None
+                return None
+
+            page_candidates: List[int] = []
+            extra_docs = self.vector_store.keyword_search_in_file(
+                filename=source_name,
+                keywords=[doctor, "醫師專長", "專長"],
+                session_id=None,
+                limit=120,
+            )
+            for ex in extra_docs:
+                ex_meta = ex.metadata if isinstance(ex.metadata, dict) else {}
+                ex_text = str(ex.page_content or "")
+                if doctor not in ex_text:
+                    continue
+                if not any(k in ex_text for k in ("醫師專長", "專長", "擅長", "主治")):
+                    continue
+                try:
+                    p = int(ex_meta.get("page"))
+                    page_candidates.append(p)
+                except Exception:
+                    continue
+
+            if page_candidates:
+                # 取最常見頁碼；同票時取較小頁碼
+                freq: Dict[int, int] = {}
+                for p in page_candidates:
+                    freq[p] = freq.get(p, 0) + 1
+                chosen = sorted(freq.items(), key=lambda x: (-x[1], x[0]))[0][0]
+                inferred_page_cache[cache_key] = chosen
+                return chosen
+
+            inferred_page_cache[cache_key] = None
+            return None
+
+        def _collect_from_candidates(candidates: List[Any]):
+            nonlocal evidences, seen
+            for d in candidates or []:
+                meta = d.metadata if isinstance(d.metadata, dict) else {}
+                content = str(d.page_content or "").strip()
+                if not content:
+                    continue
+                source = os.path.basename(str(meta.get("source", "") or meta.get("filename", "") or "unknown"))
+
+                # 優先命中「醫師專長：姓名-專長內容」條目，避免誤抓門診班表片段
+                if doctor_name:
+                    strong_match = re.search(
+                        rf"{re.escape(doctor_name)}\s*[-－—:：]\s*([^\n。；]+)",
+                        content
+                    )
+                    if strong_match and any(k in content for k in ("專長", "擅長", "主治")):
+                        page_val = meta.get("page")
+                        try:
+                            page_num = int(page_val)
+                        except Exception:
+                            page_num = _resolve_page_with_fallback(source, doctor_name)
+                        if page_num is not None:
+                            specialty_text = strong_match.group(1).strip()
+                            specialty_text = re.sub(r"\s+", " ", specialty_text)
+                            snippet = f"{doctor_name}-{specialty_text}"
+                            if len(snippet) > 140:
+                                snippet = snippet[:137] + "..."
+                            key = f"{source}|{page_num}|{snippet}"
+                            if key not in seen:
+                                seen.add(key)
+                                evidences.append({
+                                    "source": source,
+                                    "page": page_num,
+                                    "snippet": snippet,
+                                })
+                                if len(evidences) >= max_items:
+                                    return
+                            continue
+
+                if doctor_name and doctor_name not in content:
+                    continue
+                if not any(t in content for t in profile_terms):
+                    continue
+                if doctor_name:
+                    # 專長條目常見格式：姓名-專長內容（同段中專長關鍵字可能離第一位很遠）
+                    direct_name_profile = bool(
+                        re.search(rf"{re.escape(doctor_name)}\s*[-－—:：]\s*", content)
+                        and any(k in content for k in ("專長", "擅長", "主治"))
+                    )
+                    if direct_name_profile:
+                        pass
+                    else:
+                        name_pos = content.find(doctor_name)
+                        profile_positions = [content.find(t) for t in profile_terms if content.find(t) >= 0]
+                        if not profile_positions:
+                            continue
+                        nearest_profile = min(profile_positions, key=lambda p: abs(p - name_pos))
+                        # 對非條目型內容放寬距離，避免同段長句被誤濾
+                        if abs(nearest_profile - name_pos) > 360:
+                            continue
+
+                page_val = meta.get("page")
+                try:
+                    page_num = int(page_val)
+                except Exception:
+                    page_num = _resolve_page_with_fallback(source, doctor_name) if doctor_name else None
+                    if page_num is None:
+                        continue
+                snippet = self._make_snippet(content, evidence_terms, radius=48, hard_limit=140)
+                if not snippet:
+                    continue
+
+                key = f"{source}|{page_num}|{snippet}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                evidences.append({
+                    "source": source,
+                    "page": page_num,
+                    "snippet": snippet,
+                })
+                if len(evidences) >= max_items:
+                    return
+
+        # 第一層：先從本輪檢索結果找
+        _collect_from_candidates(docs or [])
+
+        # 第二層：若本輪沒抓到可稽核片段，回到同檔做 lexical fallback 補撈
+        if len(evidences) < max_items:
+            source_filenames: List[str] = []
+            for d in docs or []:
+                meta = d.metadata if isinstance(d.metadata, dict) else {}
+                source_name = os.path.basename(str(meta.get("source", "")).replace("\\", "/"))
+                filename = str(meta.get("filename", "")).strip()
+                for name in (filename, source_name):
+                    if name and name not in source_filenames:
+                        source_filenames.append(name)
+
+            if not source_filenames:
+                source_filenames = self._get_valid_files()[-1:]
+
+            fallback_keywords = [doctor_name] if doctor_name else []
+            fallback_keywords += profile_terms
+
+            for fname in source_filenames:
+                # 先走 keyword 搜索（快）
+                extra_docs = self.vector_store.keyword_search_in_file(
+                    filename=fname,
+                    keywords=fallback_keywords,
+                    session_id=None,
+                    limit=50,
+                )
+                if extra_docs:
+                    _collect_from_candidates(extra_docs)
+                if len(evidences) >= max_items:
+                    break
+
+                # 再走全檔掃描（穩）
+                file_data = self.vector_store.get_file_documents(
+                    filename=fname,
+                    include_documents=True,
+                    limit=None,
+                )
+                raw_docs = file_data.get("documents", []) or []
+                raw_metas = file_data.get("metadatas", []) or []
+                scanned_docs: List[Document] = []
+                for idx, content in enumerate(raw_docs):
+                    meta = raw_metas[idx] if idx < len(raw_metas) and isinstance(raw_metas[idx], dict) else {}
+                    scanned_docs.append(Document(page_content=str(content or ""), metadata=meta))
+                _collect_from_candidates(scanned_docs)
+                if len(evidences) >= max_items:
+                    break
+
+        if doctor_name:
+            strict_evidences = [
+                ev for ev in evidences
+                if self._is_strict_profile_snippet(str(ev.get("snippet", "")), doctor_name)
+            ]
+            if strict_evidences:
+                strict_evidences = sorted(
+                    strict_evidences,
+                    key=lambda ev: len(str(ev.get("snippet", ""))),
+                    reverse=True,
+                )
+                return strict_evidences[:max_items]
+
+        return evidences
+
+    def _enforce_profile_audit_response(self, answer_text: str, docs: List[Any], query: str) -> str:
+        answer = str(answer_text or "").strip()
+        evidences = self._collect_profile_audit_evidence(docs, query, max_items=3)
+        doctor_name = self._extract_doctor_name_from_query(query)
+
+        if not evidences:
+            return (
+                "目前在已檢索內容中找不到可稽核的「醫師專長」原文片段（含頁碼）。\n"
+                "請改問該醫師門診時段，或上傳醫師簡介/專長文件後再查詢。"
+            )
+
+        strict_evidences = []
+        if doctor_name:
+            strict_evidences = [
+                ev for ev in evidences
+                if self._is_strict_profile_snippet(str(ev.get("snippet", "")), doctor_name)
+            ]
+
+        answer_from_evidence = ""
+        if doctor_name and strict_evidences:
+            specialties: List[str] = []
+            for ev in strict_evidences:
+                specialty = self._extract_specialty_from_snippet(str(ev.get("snippet", "")), doctor_name)
+                if not specialty:
+                    continue
+                if any(specialty in existed or existed in specialty for existed in specialties):
+                    continue
+                specialties.append(specialty)
+            if specialties:
+                answer_from_evidence = f"{doctor_name}醫師的專長是：{'；'.join(specialties[:2])}。"
+
+        if answer_from_evidence:
+            answer = answer_from_evidence
+
+        # 永遠以後端證據重建引用區塊，避免模型自行產生錯誤頁碼。
+        if "【可稽核引用】" in answer:
+            answer = answer.split("【可稽核引用】", 1)[0].strip()
+
+        citation_evidences = strict_evidences if strict_evidences else evidences
+        lines = [answer, "", "【可稽核引用】"]
+        for ev in citation_evidences:
+            lines.append(f"- 來源：{ev['source']} 第 {ev['page']} 頁")
+            lines.append(f"引用片段：{ev['snippet']}")
+        return "\n".join(lines).strip()
+
+    @staticmethod
+    def _is_page_raw_doc(doc: Any) -> bool:
+        try:
+            dtype = str((doc.metadata or {}).get("type", "")).strip().lower()
+            return dtype in {"page_raw_local", "page_raw"}
+        except Exception:
+            return False
+
+    @staticmethod
+    def _collect_candidate_pages_from_docs(docs: List[Any], max_pages: int = 6) -> List[int]:
+        pages: List[int] = []
+        seen = set()
+        for d in docs or []:
+            if ChatService._is_page_raw_doc(d):
+                continue
+            page_val = (d.metadata or {}).get("page")
+            try:
+                page_num = int(page_val)
+            except Exception:
+                continue
+            if page_num in seen:
+                continue
+            seen.add(page_num)
+            pages.append(page_num)
+            if len(pages) >= max_pages:
+                break
+        return pages
+
+    @staticmethod
+    def _needs_parent_layer_expansion(query: str, top_score: float, docs: List[Any]) -> bool:
+        text = str(query or "")
+        strong_keywords = (
+            "專長", "擅長", "主治", "學經歷", "注意事項", "說明", "規定",
+            "防疫", "小叮嚀", "逐頁", "頁碼", "探病", "收費", "證件",
+        )
+        if any(k in text for k in strong_keywords):
+            return True
+        if top_score < 0.22:
+            return True
+        # If no page number at all in child hits, parent page_raw often helps.
+        has_page = any(str((d.metadata or {}).get("page", "")).strip() for d in (docs or []))
+        return not has_page
+
+    def _expand_docs_with_parent_pages(
+            self,
+            docs: List[Any],
+            filename: str,
+            session_id: str,
+            query: str,
+            top_score: float,
+    ) -> List[Any]:
+        if not docs or not filename:
+            return docs
+        if not self._needs_parent_layer_expansion(query, top_score, docs):
+            return docs
+
+        target_pages = self._collect_candidate_pages_from_docs(docs, max_pages=6)
+        parent_docs = self.vector_store.get_page_raw_documents(
+            filename=filename,
+            pages=target_pages,
+            session_id=session_id if session_id else None,
+            total_limit=6,
+        )
+        if not parent_docs:
+            return docs
+
+        merged = list(docs)
+        seen = set()
+        for d in merged:
+            key = f"{(d.metadata or {}).get('type','')}|{(d.metadata or {}).get('page','')}|{str(d.page_content)[:160]}"
+            seen.add(key)
+        appended = 0
+        for d in parent_docs:
+            key = f"{(d.metadata or {}).get('type','')}|{(d.metadata or {}).get('page','')}|{str(d.page_content)[:160]}"
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(d)
+            appended += 1
+
+        logger.info(
+            "父子檢索補強：加入 page_raw %s 筆（pages=%s top_score=%.4f）",
+            appended,
+            target_pages,
+            top_score,
+        )
+        return merged
+
+    @staticmethod
     def _parse_slot_sentence(content: str) -> Dict[str, str]:
         """
         從 schedule_slot 句型中補抓 department/day/period/doctor。
@@ -467,6 +990,61 @@ class ChatService:
                 doctors.append(token)
         return doctors
 
+    @staticmethod
+    def _detect_schedule_scope(query: str) -> Optional[Dict[str, Any]]:
+        text = str(query or "")
+        if not text:
+            return None
+
+        mentions_branch = any(k in text for k in ("嘉義", "灣橋"))
+        mentions_scope = any(k in text for k in ("分院", "支援", "院區"))
+        if not (mentions_branch and mentions_scope):
+            return None
+
+        return {
+            "key": "chiayi_wanqiao_support",
+            "label": "嘉義暨灣橋分院支援門診",
+            "strong_terms": (
+                "支援嘉義暨灣橋分院",
+                "嘉義暨灣橋分院",
+                "嘉義分院",
+                "灣橋分院",
+            ),
+            "weak_terms": ("嘉義", "灣橋", "分院", "支援"),
+        }
+
+    @staticmethod
+    def _row_matches_schedule_scope(row: Dict[str, Any], scope: Optional[Dict[str, Any]]) -> bool:
+        if not scope:
+            return True
+
+        scope_key = str(scope.get("key", "")).strip()
+        row_scope_key = str(row.get("scope_key", "")).strip()
+        if scope_key and row_scope_key:
+            return row_scope_key == scope_key
+
+        hay = " ".join(
+            [
+                str(row.get("table_title", "")),
+                str(row.get("content", "")),
+                str(row.get("dept", "")),
+                str(row.get("scope_label", "")),
+            ]
+        )
+        if not hay.strip():
+            return False
+
+        for term in scope.get("strong_terms", ()) or ():
+            if term and term in hay:
+                return True
+
+        weak_terms = list(scope.get("weak_terms", ()) or ())
+        weak_hits = sum(1 for t in weak_terms if t and t in hay)
+        if weak_hits >= 2:
+            return True
+
+        return False
+
     def _format_schedule_slots_answer(
             self,
             query: str,
@@ -479,6 +1057,9 @@ class ChatService:
         優先用向量庫中的結構化 schedule_slot 回答，避免 CSV 欄位偏移造成無門診誤判。
         回傳空字串代表不適用或查無可用資料，外層可退回 pandas/RAG。
         """
+        if self._is_doctor_profile_query(query):
+            # 專長問題不應走門診班表直答，交給 RAG+可稽核引用流程
+            return ""
         try:
             slot_data = self.vector_store.get_schedule_slot_documents(
                 file_path=file_path,
@@ -494,6 +1075,8 @@ class ChatService:
 
             constraints = TableAnalyzerService._extract_constraints(query)
             dept_keyword = TableAnalyzerService._infer_department_keyword(query)
+            dept_keyword = self._normalize_schedule_department_keyword(query, dept_keyword)
+            schedule_scope = self._detect_schedule_scope(query)
             special_strategy = TableAnalyzerService.get_special_department_strategy(query)
             include_days = constraints.get("include_days", set()) or set()
             exclude_days = constraints.get("exclude_days", set()) or set()
@@ -524,6 +1107,8 @@ class ChatService:
                 period = str(meta.get("period") or "").strip() or "未註明"
                 doctor = clean_doctor_name(str(meta.get("doctor") or "").strip())
                 table_title = str(meta.get("table_title") or "").strip()
+                scope_key = str(meta.get("scope_key") or "").strip()
+                scope_label = str(meta.get("scope_label") or "").strip()
 
                 # fallback：舊資料常只有 page_content，無結構化 metadata
                 if (not dept or not day or not doctor) and content:
@@ -537,6 +1122,18 @@ class ChatService:
                 doctor_list = self._split_slot_doctors(doctor)
                 if not dept or not day or not doctor_list:
                     continue
+                row_preview = {
+                    "dept": dept,
+                    "day": day,
+                    "period": period,
+                    "doctors": doctor_list,
+                    "content": content,
+                    "table_title": table_title,
+                    "scope_key": scope_key,
+                    "scope_label": scope_label,
+                }
+                if schedule_scope and not self._row_matches_schedule_scope(row_preview, schedule_scope):
+                    continue
                 if include_days and day not in include_days:
                     continue
                 if day in exclude_days:
@@ -545,16 +1142,18 @@ class ChatService:
                     continue
                 if period in exclude_periods:
                     continue
-                slot_rows.append(
-                    {
-                        "dept": dept,
-                        "day": day,
-                        "period": period,
-                        "doctors": doctor_list,
-                        "content": content,
-                        "table_title": table_title,
-                    }
-                )
+                slot_rows.append(row_preview)
+
+            # 預設查詢（未指定分院）優先使用非分院資料，避免與支援分院表混網。
+            if not schedule_scope and slot_rows:
+                non_branch_rows = [r for r in slot_rows if not str(r.get("scope_key", "")).strip()]
+                if non_branch_rows and len(non_branch_rows) < len(slot_rows):
+                    logger.info(
+                        "院區預設過濾：保留總院 rows=%s，排除分院 rows=%s",
+                        len(non_branch_rows),
+                        len(slot_rows) - len(non_branch_rows),
+                    )
+                    slot_rows = non_branch_rows
 
             def build_grouping(row_matcher):
                 grouped_local: Dict[str, Dict[str, List[str]]] = {}
@@ -647,6 +1246,12 @@ class ChatService:
                 return items
 
             primary_candidate_rows = [row for row in slot_rows if primary_matcher(row)]
+            if schedule_scope:
+                logger.info(
+                    "院區範圍過濾啟用: scope=%s rows_after_scope=%s",
+                    str(schedule_scope.get("label", "")),
+                    len(slot_rows),
+                )
             if special_strategy:
                 logger.info(
                     "特診第一階段命中: label=%s terms=%s rows=%s sample=%s",
@@ -952,8 +1557,21 @@ class ChatService:
                             intent_result = "RAG"
 
                     logger.info(f" 🎯 最終路由判定: {intent_result}")
-                    if "PANDAS" in intent_result and not TableAnalyzerService.looks_like_schedule_query(real_query):
-                        logger.info("PANDAS 防呆：偵測為非門診查詢，改走 RAG")
+                    if (
+                            intent_result == "RAG"
+                            and TableAnalyzerService.looks_like_schedule_query(real_query)
+                            and not self._is_doctor_profile_query(real_query)
+                            and not self._is_textual_rag_force_query(real_query)
+                    ):
+                        logger.info("路由修正：偵測為門診排班查詢，改由 PANDAS 處理")
+                        intent_result = "PANDAS"
+
+                    if "PANDAS" in intent_result and (
+                            self._is_doctor_profile_query(real_query)
+                            or self._is_textual_rag_force_query(real_query)
+                            or not TableAnalyzerService.looks_like_schedule_query(real_query)
+                    ):
+                        logger.info("PANDAS 防呆：偵測為專長/非門診查詢，改走 RAG")
                         intent_result = "RAG"
 
                     if "PANDAS" in intent_result:
@@ -1052,7 +1670,12 @@ class ChatService:
                 for m in matches:
                     search_query += f" {m}"
 
-            logger.info("執行檢索: %s (限定檔案: %s)", search_query, valid_files[-1] if valid_files else "無檔案")
+            lexical_target_filenames = self._build_lexical_target_filenames(valid_files, real_query)
+            logger.info(
+                "執行檢索: %s (限定檔案: %s)",
+                search_query,
+                lexical_target_filenames[0] if lexical_target_filenames else "無檔案",
+            )
 
             docs = self.vector_store.search(search_query, k=50, filter=file_filter)
             if sid and not docs:
@@ -1062,6 +1685,13 @@ class ChatService:
                     search_query,
                 )
                 docs = self.vector_store.search(search_query, k=50, filter=None)
+
+            if docs:
+                before_count = len(docs)
+                docs = [d for d in docs if not self._is_page_raw_doc(d)]
+                removed = before_count - len(docs)
+                if removed > 0:
+                    logger.info("子層檢索過濾 page_raw：移除 %s 筆", removed)
 
             if docs:
                 logger.info("啟動 Reranker 精讀專家，重新評分中...")
@@ -1098,12 +1728,36 @@ class ChatService:
             if valid_files and (not docs or top_score < 0.05):
                 lexical_terms = self._build_lexical_fallback_terms(real_query, ai_keywords)
                 if lexical_terms:
-                    lexical_docs = self.vector_store.keyword_search_in_file(
-                        filename=valid_files[-1],
-                        keywords=lexical_terms,
-                        session_id=sid if sid else None,
-                        limit=15,
-                    )
+                    tmp_docs = []
+                    targets = lexical_target_filenames or [valid_files[-1]]
+                    for target_name in targets:
+                        per_file_docs = self.vector_store.keyword_search_in_file(
+                            filename=target_name,
+                            keywords=lexical_terms,
+                            session_id=sid if sid else None,
+                            limit=15,
+                        )
+                        if per_file_docs:
+                            tmp_docs.extend(per_file_docs)
+                            logger.info(
+                                "關鍵字補撈命中: file=%s hits=%s",
+                                target_name,
+                                len(per_file_docs),
+                            )
+
+                    if tmp_docs:
+                        deduped = []
+                        seen_keys = set()
+                        for d in tmp_docs:
+                            source = str(d.metadata.get("source", ""))
+                            page = str(d.metadata.get("page", ""))
+                            key = f"{source}|{page}|{str(d.page_content)[:200]}"
+                            if key in seen_keys:
+                                continue
+                            seen_keys.add(key)
+                            deduped.append(d)
+                        lexical_docs = deduped
+
                     if lexical_docs:
                         logger.info(
                             "低相似度觸發關鍵字補撈：新增 %s 筆（top_score=%.4f）",
@@ -1115,11 +1769,28 @@ class ChatService:
             # 若是「逐頁搜尋/列出頁碼」題型，且已命中 lexical fallback，直接回覆頁碼，避免 LLM 漏答。
             page_intent = any(k in real_query for k in ["逐頁", "頁碼", "第幾頁", "哪一頁", "頁面"])
             if page_intent and lexical_docs:
-                lexical_docs = self.vector_store.backfill_pages_for_documents(
-                    filename=valid_files[-1],
-                    docs=lexical_docs,
-                    session_id=sid if sid else None,
-                )
+                # Support multi-file lexical fallback: backfill pages by each filename group.
+                grouped_docs: Dict[str, List[Any]] = {}
+                for d in lexical_docs:
+                    fname = str(d.metadata.get("filename", "") or "").strip()
+                    if not fname:
+                        src = str(d.metadata.get("source", "") or "")
+                        fname = os.path.basename(src) if src else ""
+                    if not fname:
+                        continue
+                    grouped_docs.setdefault(fname, []).append(d)
+
+                backfilled: List[Any] = []
+                for fname, docs_group in grouped_docs.items():
+                    backfilled.extend(
+                        self.vector_store.backfill_pages_for_documents(
+                            filename=fname,
+                            docs=docs_group,
+                            session_id=sid if sid else None,
+                        )
+                    )
+                if backfilled:
+                    lexical_docs = backfilled
                 pages: list[int] = []
                 unknown_count = 0
                 for d in lexical_docs:
@@ -1167,7 +1838,6 @@ class ChatService:
                     logger.info("狙擊成功：已將最新檔案 (%s) 強制加入 %s 筆候選池！", latest_file_name, len(latest_docs))
                 except Exception as e:
                     logger.warning("最新檔案狙擊發生錯誤: %s", e)
-            # ================================================================
 
             # 新增：狙擊模式 (Sniper Mode)
             if matches:
@@ -1264,6 +1934,21 @@ class ChatService:
                                 logger.info("成功補完 ID: %s", fetched_id)
                                 break
 
+            # 2.5 父子檢索補強：由 child 命中頁碼拉取 parent page_raw 全頁文本
+            current_top_score = 0.0
+            if docs:
+                try:
+                    current_top_score = max(float(d.metadata.get("rerank_score", 0.0) or 0.0) for d in docs)
+                except Exception:
+                    current_top_score = 0.0
+            docs = self._expand_docs_with_parent_pages(
+                docs=docs,
+                filename=valid_files[-1] if valid_files else "",
+                session_id=sid,
+                query=real_query,
+                top_score=current_top_score,
+            )
+
             # 3. 排序與 Context
             def final_rank(doc):
                 score = 0
@@ -1289,6 +1974,7 @@ class ChatService:
                 if "【系統自動補完" in content: score += 50
                 if doc.metadata.get("lexical_hit"): score += 1200
                 if doc.metadata.get("type") == "file_summary": score += 1000
+                if doc.metadata.get("parent_layer"): score += 80
                 if real_query in content: score += 100
                 return score
 
@@ -1311,12 +1997,15 @@ class ChatService:
 
                 if doc.metadata.get("type") == "file_summary":
                     prefix = f"【全域摘要：{source}】"
+                elif doc.metadata.get("type") in {"page_raw_local", "page_raw"}:
+                    prefix = f"【整頁全文：{source}{label}】"
                 else:
                     prefix = f"【來源：{source}{label}】"
 
                 final_context_list.append(f"{prefix}\n{doc.page_content}")
 
             schedule_like_query = TableAnalyzerService.looks_like_schedule_query(real_query)
+            doctor_profile_query = self._is_doctor_profile_query(real_query)
 
             if file_count > 0:
                 final_context = "\n\n".join(final_context_list) if final_context_list else "無具體內容。"
@@ -1370,6 +2059,28 @@ class ChatService:
                 else '5. **NON-SCHEDULE MODE**: This query is not a schedule query. Do NOT reply with '
                      '"目前查無相關門診資料" unless the user is explicitly asking about clinic schedules.'
             )
+            profile_audit_rule = (
+                """
+                            [DOCTOR PROFILE AUDIT MODE - MANDATORY]
+                            - This is a doctor profile/specialty query.
+                            - You MUST include at least one citation block with:
+                              1) page number
+                              2) a short direct quote snippet from [RETRIEVED KNOWLEDGE]
+                            - Output format requirement:
+                              【可稽核引用】
+                              - 來源：<filename> 第 <page> 頁
+                              引用片段：<quote snippet>
+                            - If no qualifying specialty evidence exists, explicitly say no auditable specialty evidence is found.
+                """
+                if doctor_profile_query
+                else ""
+            )
+            language_strict_rule = (
+                "4. **TRADITIONAL CHINESE ONLY**: If the user question contains Chinese characters, "
+                "you MUST output in Traditional Chinese (zh-TW) only. Never use Simplified Chinese."
+                if re.search(r"[\u4e00-\u9fff]", str(real_query or ""))
+                else ""
+            )
 
             template_str = r"""You are a professional, multilingual AI document analysis assistant.
 
@@ -1402,6 +2113,7 @@ class ChatService:
                             1. **AUTO-DETECT**: Detect the language used in the [USER QUESTION].
                             2. **MATCH LANGUAGE**: Your entire response MUST be in the **SAME language** as the [USER QUESTION].
                             3. **TRANSLATION REQUIRED**: Read the context, understand it, and TRANSLATE & EXPLAIN it in the user's target language.
+                            {language_strict_rule}
 
                             [CRITICAL READING RULES]
                             1. **NO SIMPLIFICATION**: When citation involves numbers, money, or days, DO NOT output a single number if the document lists a range or conditions.
@@ -1409,6 +2121,7 @@ class ChatService:
                             3. **FACTUAL ACCURACY**: Your answer must perfectly match the [RETRIEVED KNOWLEDGE].
                             4. **CHAPTER MATCHING**: If the user asks for a specific Chapter (e.g., Chapter 7), YOU MUST ONLY use information from that chapter. If the retrieved context only shows Chapter 3, you must truthfully say: "I cannot find the content for Chapter 7 in the retrieved context," and DO NOT hallucinate using other chapters.
                             {anti_hallucination_rule}
+                            {profile_audit_rule}
                             """
 
             # 將變數塞入系統 Prompt 中
@@ -1420,6 +2133,8 @@ class ChatService:
                 history=history_text,
                 question=real_query,
                 anti_hallucination_rule=anti_hallucination_rule,
+                profile_audit_rule=profile_audit_rule,
+                language_strict_rule=language_strict_rule,
             )
 
             # 組合使用者的多模態訊息 (文字 + 圖片)
@@ -1439,7 +2154,16 @@ class ChatService:
                 HumanMessage(content=human_content)
             ]
 
-            # 繞過只能處理純文字的 prompt chain，直接丟給模型做 astream 串流輸出
+            # 專長查詢：先同步產出全文，再用後端硬規則補上可稽核引用（頁碼＋片段）
+            if doctor_profile_query:
+                answer_msg = await self.llm.ainvoke(messages)
+                answer_text = answer_msg.content if hasattr(answer_msg, "content") else str(answer_msg)
+                answer_text = answer_text.replace("<br>", "\n").replace("<b>", "**").replace("</b>", "**")
+                enforced = self._enforce_profile_audit_response(answer_text, docs, real_query)
+                yield enforced
+                return
+
+            # 非專長查詢維持串流輸出
             async for chunk in self.llm.astream(messages):
                 text_chunk = chunk.content if hasattr(chunk, 'content') else str(chunk)
                 clean_chunk = text_chunk.replace("<br>", "\n").replace("<b>", "**").replace("</b>", "**")
